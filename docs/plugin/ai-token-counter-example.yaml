@@ -1,0 +1,99 @@
+# AI Token Counter Plugin Configuration Example
+# Place this file in your APISIX conf directory as reference
+
+# Route Configuration Example:
+# {
+#   "uri": "/v1/chat/*",
+#   "plugins": {
+#     "ai-token-counter": {
+#       "limit": {
+#         "prompt_tokens": 10000,      # Max prompt tokens per minute per IP
+#         "completion_tokens": 5000,    # Max completion tokens per minute per IP
+#         "total_tokens": 15000         # Max total tokens per minute per IP
+#       },
+#       "pricing": {
+#         "prompt_tokens": 0.5,         # $0.5 per 1M prompt tokens
+#         "completion_tokens": 1.5       # $1.5 per 1M completion tokens
+#       },
+#       "redis": {
+#         "host": "127.0.0.1",
+#         "port": 6379,
+#         "password": "",
+#         "database": 0,
+#         "key_prefix": "ai_token:"
+#       },
+#       "log": {
+#         "enabled": true,
+#         "response_headers": true,       # Add X-AI-* headers to response
+#         "prometheus": true              # Export Prometheus metrics
+#       }
+#     }
+#   },
+#   "upstream": {
+#     "type": "roundrobin",
+#     "nodes": {
+#       "api.openai.com:443": 1
+#     }
+#   }
+# }
+
+# Global Metadata Configuration:
+# {
+#   "id": "ai-token-counter-global",
+#   "plugins": {
+#     "ai-token-counter": {
+#       "metric_prefix": "ai_token_"  # Optional: customize metric prefix
+#     }
+#   }
+# }
+
+# Control API - Get Prometheus Metrics:
+# GET /v1/ai-token-counter/metrics
+#
+# This endpoint returns Prometheus-formatted metrics:
+#
+# ai_token_prompt_tokens_total{provider="openai",model="gpt-4o",consumer="none",route="1"} 150
+# ai_token_completion_tokens_total{provider="openai",model="gpt-4o",consumer="none",route="1"} 80
+# ai_token_total_tokens_total{provider="openai",model="gpt-4o",consumer="none",route="1"} 230
+# ai_token_requests_total{provider="openai",model="gpt-4o",consumer="none",route="1",status="success"} 1
+# ai_token_latency_ms_bucket{provider="openai",model="gpt-4o",consumer="none",route="1",le="100"} 1
+# ai_token_cost_usd_total_bucket{provider="openai",model="gpt-4o",consumer="none",route="1",le="0.001"} 1
+
+# Response Headers (when log.response_headers is true):
+# X-AI-Prompt-Tokens: 150       # Number of prompt tokens used
+# X-AI-Completion-Tokens: 80   # Number of completion tokens used
+# X-AI-Total-Tokens: 230        # Total tokens used
+# X-AI-Cost: 0.000195           # Calculated cost in USD
+
+# Prometheus Metrics Exported:
+# | Metric Name                          | Type      | Labels                              | Description                          |
+# |-------------------------------------|-----------|-------------------------------------|--------------------------------------|
+# | ai_token_prompt_tokens_total        | Counter   | provider, model, consumer, route    | Total prompt tokens processed        |
+# | ai_token_completion_tokens_total     | Counter   | provider, model, consumer, route    | Total completion tokens generated    |
+# | ai_token_total_tokens_total         | Counter   | provider, model, consumer, route    | Total tokens processed               |
+# | ai_token_requests_total             | Counter   | provider, model, consumer, route, status | Total AI requests by status      |
+# | ai_token_latency_ms                | Histogram | provider, model, consumer, route    | Request latency in milliseconds      |
+# | ai_token_cost_usd_total            | Histogram | provider, model, consumer, route    | Total cost in USD                    |
+# | ai_token_current_prompt_tokens      | Gauge     | provider, model, consumer, route    | Current prompt tokens in window     |
+# | ai_token_current_completion_tokens  | Gauge     | provider, model, consumer, route    | Current completion tokens in window  |
+# | ai_token_current_total_tokens       | Gauge     | provider, model, consumer, route    | Current total tokens in window       |
+
+# Grafana Dashboard Queries Example:
+# Total Tokens per Minute:
+#   sum(rate(ai_token_total_tokens_total[1m])) by (provider, model)
+#
+# Request Count by Status:
+#   sum(rate(ai_token_requests_total[5m])) by (status)
+#
+# Average Latency:
+#   histogram_quantile(0.95, rate(ai_token_latency_ms_bucket[5m]))
+#
+# Total Cost:
+#   sum(increase(ai_token_cost_usd_total[1h]))
+
+# Use Cases:
+# 1. Token Rate Limiting - Control AI API usage per user/IP
+# 2. Cost Tracking - Track API usage costs by user
+# 3. Budget Control - Prevent unexpected high API bills
+# 4. Analytics - Monitor AI token consumption patterns
+# 5. Prometheus Integration - Scrape metrics with Prometheus/Grafana
