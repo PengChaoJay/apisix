@@ -447,17 +447,17 @@ HTTP/1.1 200 OK
 
 ## What is the `X-API-KEY` of the Admin API? Can it be modified?
 
-`X-API-KEY` of the Admin API refers to the `apisix.admin_key.key` in your `conf/config.yaml` file. It is the access token for the Admin API.
+`X-API-KEY` of the Admin API refers to `deployment.admin.admin_key[0].key` in your `conf/config.yaml` file. It is the access token for the Admin API.
 
-By default, it is set to `edd1c9f034335f136f87ad84b625c8f1` and can be modified by changing the parameter in your `conf/config.yaml` file:
+In the default configuration, this field is empty. APISIX generates a random Admin API key during initialization and writes it back to `conf/config.yaml`. You can also set the key explicitly by changing the parameter in your `conf/config.yaml` file:
 
 ```yaml
-apisix:
-  admin_key
-    -
-      name: "admin"
-      key: newkey
-      role: admin
+deployment:
+  admin:
+    admin_key:
+      - name: "admin"
+        key: newkey
+        role: admin
 ```
 
 Now, to access the Admin API:
@@ -679,7 +679,7 @@ Another solution is to switch to an experimental gRPC-based configuration synchr
 
 ## Why is the file-logger logging garbled?
 
-If you are using the `file-logger` plugin but getting garbled logs, one possible reason is your upstream response has returned a compressed response body. You can fix this by setting the accept-encoding in the request header to not receive compressed responses using the [proxy-rewirte](https://apisix.apache.org/docs/apisix/plugins/proxy-rewrite/) plugin:
+If you are using the `file-logger` plugin but getting garbled logs, one possible reason is your upstream response has returned a compressed response body. You can fix this by setting the accept-encoding in the request header to not receive compressed responses using the [proxy-rewrite](https://apisix.apache.org/docs/apisix/plugins/proxy-rewrite/) plugin:
 
 ```shell
 curl http://127.0.0.1:9180/apisix/admin/routes/1 \
@@ -728,7 +728,7 @@ The `ssls` is managed through the `/apisix/admin/ssls` API. It's used for managi
 
 The `tls.client_cert`, `tls.client_key`, and `tls.client_cert_id` in upstream are used for mTLS communication with the upstream.
 
-The `ssl_trusted_certificate` in `config.yaml` configures a trusted CA certificate. It is used for verifying some certificates signed by private authorities within APISIX, to avoid APISIX rejects the certificate. Note that it is not used to trust the certificates of APISIX upstream, because APISIX does not verify the legality of the upstream certificates. Therefore, even if the upstream uses an invalid TLS certificate, it can still be accessed without configuring a root certificate.
+The `ssl_trusted_certificate` in `config.yaml` configures a trusted CA certificate. It is used for verifying some certificates signed by private authorities within APISIX, to avoid APISIX rejects the certificate. Note that APISIX does not verify the certificate of an upstream unless that upstream sets `tls.verify` to `true`, so by default an upstream using an invalid TLS certificate can still be accessed. Once `tls.verify` is enabled, the certificate is checked against the upstream's own `tls.ca_certs` if set, and against `ssl_trusted_certificate` otherwise.
 
 ## Where can I find more answers?
 

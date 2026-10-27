@@ -16,7 +16,6 @@
 --
 
 local core = require("apisix.core")
-local plugin = require("apisix.plugin")
 local log_util = require("apisix.utils.log-util")
 local bp_manager_mod = require("apisix.utils.batch-processor-manager")
 local cls_sdk = require("apisix.plugins.tencent-cloud-cls.cls-sdk")
@@ -31,7 +30,8 @@ local schema = {
     properties = {
         cls_host = { type = "string" },
         cls_topic = { type = "string" },
-        scheme = { type = "string", default = "https"},
+        scheme = { type = "string", enum = {"http", "https"}, default = "https" },
+        ssl_verify = { type = "boolean", default = true },
         secret_id = { type = "string" },
         secret_key = { type = "string" },
         sample_ratio = {
@@ -56,8 +56,11 @@ local schema = {
                 type = "array"
             }
         },
+        max_req_body_bytes = { type = "integer", minimum = 1, default = 524288 },
+        max_resp_body_bytes = { type = "integer", minimum = 1, default = 524288 },
         global_tag = { type = "object" },
         log_format = {type = "object"},
+        log_format_extra = {type = "object"},
     },
     encrypt_fields = {"secret_key"},
     required = { "cls_host", "cls_topic", "secret_id", "secret_key" }
@@ -67,13 +70,11 @@ local schema = {
 local metadata_schema = {
     type = "object",
     properties = {
-        log_format = {
+        log_format_extra = {
             type = "object"
         },
-        max_pending_entries = {
-            type = "integer",
-            description = "maximum number of pending entries in the batch processor",
-            minimum = 1,
+        log_format = {
+            type = "object"
         },
     },
 }
@@ -84,7 +85,7 @@ local _M = {
     priority = 397,
     name = plugin_name,
     schema = batch_processor_manager:wrap_schema(schema),
-    metadata_schema = metadata_schema,
+    metadata_schema = batch_processor_manager:wrap_metadata_schema(metadata_schema),
 }
 
 
@@ -106,8 +107,11 @@ function _M.access(conf, ctx)
     if conf.sample_ratio == 1 or math.random() < conf.sample_ratio then
         core.log.debug("cls sampled")
         ctx.cls_sample = true
+    else
         return
     end
+
+    log_util.check_and_read_req_body(conf, ctx)
 end
 
 
@@ -119,9 +123,6 @@ end
 
 
 function _M.log(conf, ctx)
-    local metadata = plugin.plugin_metadata(plugin_name)
-    local max_pending_entries = metadata and metadata.value and
-                                metadata.value.max_pending_entries or nil
     -- sample if set
     if not ctx.cls_sample then
         core.log.debug("cls not sampled, skip log")
@@ -136,7 +137,7 @@ function _M.log(conf, ctx)
         end
     end
 
-    if batch_processor_manager:add_entry(conf, entry, max_pending_entries) then
+    if batch_processor_manager:add_entry(conf, entry) then
         return
     end
 
@@ -144,7 +145,7 @@ function _M.log(conf, ctx)
         local sdk, err = cls_sdk.new(
                             conf.scheme, conf.cls_host,
                             conf.cls_topic, conf.secret_id,
-                            conf.secret_key)
+                            conf.secret_key, conf.ssl_verify)
         if err then
             core.log.error("init sdk failed err:", err)
             return false, err
@@ -152,8 +153,7 @@ function _M.log(conf, ctx)
         return sdk:send_to_cls(entries)
     end
 
-    batch_processor_manager:add_entry_to_new_processor(conf, entry, ctx,
-                                                        process, max_pending_entries)
+    batch_processor_manager:add_entry_to_new_processor(conf, entry, ctx, process)
 end
 
 

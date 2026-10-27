@@ -15,9 +15,12 @@
 -- limitations under the License.
 --
 local core = require("apisix.core")
-local ai_drivers_schema = require("apisix.plugins.ai-drivers.schema")
+local ai_providers_schema = require("apisix.plugins.ai-providers.schema")
+local protocols = require("apisix.plugins.ai-protocols")
 local require = require
 local pcall = pcall
+local next = next
+local type = type
 local ngx = ngx
 local HTTP_BAD_REQUEST = ngx.HTTP_BAD_REQUEST
 local HTTP_INTERNAL_SERVER_ERROR = ngx.HTTP_INTERNAL_SERVER_ERROR
@@ -57,6 +60,13 @@ local model_options_schema = {
 local schema = {
     type = "object",
     properties = {
+        max_req_body_size = {
+            type = "integer",
+            minimum = 1,
+            default = 67108864,
+            description = "maximum request body size in bytes buffered into "
+                       .. "memory; larger request bodies are rejected",
+        },
         prompt = {
             type = "string",
             description = "The prompt to rewrite client request."
@@ -64,7 +74,7 @@ local schema = {
         provider = {
             type = "string",
             description = "Name of the AI service provider.",
-            enum = ai_drivers_schema.providers,
+            enum = ai_providers_schema.providers,
         },
         auth = auth_schema,
         options = model_options_schema,
@@ -110,43 +120,49 @@ local _M = {
     schema = schema
 }
 
-local function request_to_llm(conf, request_table, ctx)
-    local ok, ai_driver = pcall(require, "apisix.plugins.ai-drivers." .. conf.provider)
+local function request_to_llm(conf, request_table, ctx, target_path)
+    local ok, ai_provider = pcall(require, "apisix.plugins.ai-providers." .. conf.provider)
     if not ok then
-        return nil, nil, "failed to load ai-driver: " .. conf.provider
+        return nil, nil, "failed to load ai-provider: " .. conf.provider
     end
 
     local extra_opts = {
         endpoint = core.table.try_read_attr(conf, "override", "endpoint"),
         auth = conf.auth,
-        model_options = conf.options
+        model_options = conf.options,
+        target_path = target_path,
     }
+    -- Nothing downstream-derived is handed over: no client headers, no verbatim
+    -- client body -- this call carries its own credentials and its own body.
     ctx.llm_request_start_time = ngx.now()
     ctx.var.llm_request_body = request_table
-    return ai_driver:request(ctx, conf, request_table, extra_opts)
+    return ai_provider:request(conf, request_table, extra_opts)
 end
 
 
-local function parse_llm_response(res_body)
-    local response_table, err = core.json.decode(res_body)
-
-    if err then
-        return nil, "failed to decode llm response " .. ", err: " .. err
+local function get_provider_protocol(conf, ctx)
+    local ok, ai_provider = pcall(require, "apisix.plugins.ai-providers." .. conf.provider)
+    if not ok then
+        return nil, nil, "failed to load provider: " .. conf.provider
+    end
+    local caps = ai_provider.capabilities or {}
+    -- Prefer openai-chat as the common denominator
+    local proto_name = caps["openai-chat"] and "openai-chat" or next(caps)
+    if not proto_name then
+        return nil, nil, "provider " .. conf.provider .. " has no capabilities"
     end
 
-    if not response_table.choices or not response_table.choices[1] then
-        return nil, "'choices' not in llm response"
+    local cap = caps[proto_name]
+    local target_path
+    if cap then
+        local p = cap.path
+        if type(p) == "function" then
+            p = p(conf, ctx)
+        end
+        target_path = p
     end
 
-    local message = response_table.choices[1].message
-    if not message then
-        return nil, "'message' not in llm response choices"
-    end
-
-    local data = {
-        data = message.content
-    }
-    return core.json.encode(data)
+    return protocols.get(proto_name), target_path
 end
 
 
@@ -163,25 +179,8 @@ function _M.check_schema(conf)
     return core.schema.check(schema, conf)
 end
 
-function _M.lua_body_filter(conf, ctx, headers, body)
-    if ngx.status > 299 then
-        core.log.error("LLM service returned error status: ", ngx.status)
-        return HTTP_INTERNAL_SERVER_ERROR
-    end
-
-    -- Parse LLM response
-    local llm_response, err = parse_llm_response(body)
-    if err then
-        core.log.error("failed to parse LLM response: ", err)
-        return HTTP_INTERNAL_SERVER_ERROR
-    end
-
-    return ngx.OK, llm_response
-end
-
-
 function _M.access(conf, ctx)
-    local client_request_body, err = core.request.get_body()
+    local client_request_body, err = core.request.get_body(conf.max_req_body_size)
     if err then
         core.log.warn("failed to get request body: ", err)
         return HTTP_BAD_REQUEST
@@ -189,34 +188,51 @@ function _M.access(conf, ctx)
 
     if not client_request_body then
         core.log.warn("missing request body")
-        return
+        return HTTP_BAD_REQUEST
     end
 
-    -- Prepare request for LLM service
-    local ai_request_table = {
-        messages = {
-            {
-                role = "system",
-                content = conf.prompt
-            },
-            {
-                role = "user",
-                content = client_request_body
-            }
-        },
-        stream = false
-    }
+    -- Determine provider protocol
+    local proto, target_path, proto_err = get_provider_protocol(conf, ctx)
+    if not proto then
+        core.log.error(proto_err)
+        return HTTP_INTERNAL_SERVER_ERROR
+    end
+
+    -- Build request in provider's native protocol format
+    local ai_request_table = proto.build_simple_request(
+        conf.prompt, client_request_body, conf.options)
 
     -- Send request to LLM service
-    local code, _, err = request_to_llm(conf, ai_request_table, ctx)
-    if err then
-        core.log.error("failed to request LLM: ", err)
+    local status, raw_body, req_err = request_to_llm(conf, ai_request_table, ctx, target_path)
+
+    if req_err then
+        core.log.error("failed to request LLM: ", req_err)
         return HTTP_INTERNAL_SERVER_ERROR
     end
-    if code == 429 or (code >= 500 and code < 600 ) then
-        core.log.error("LLM service returned error status: ", code)
+
+    if not status or status ~= 200 then
+        core.log.error("LLM service returned error status: ", status)
         return HTTP_INTERNAL_SERVER_ERROR
     end
+
+    -- Extract rewritten content from LLM response
+    local response_table, decode_err = core.json.decode(raw_body)
+    if not response_table then
+        core.log.error("failed to decode LLM response: ", decode_err)
+        return HTTP_INTERNAL_SERVER_ERROR
+    end
+
+    local content = proto.extract_response_text(response_table)
+    if not content then
+        core.log.error("failed to extract text from LLM response")
+        return HTTP_INTERNAL_SERVER_ERROR
+    end
+
+    -- Replace the original request body with the rewritten content
+    ngx.req.set_body_data(content)
+    -- Tell later AI plugins (ai-proxy) that the downstream body is no longer the
+    -- client's original, so they must not reuse the raw bytes as-is.
+    ctx.ai_request_body_changed = true
 end
 
 return _M

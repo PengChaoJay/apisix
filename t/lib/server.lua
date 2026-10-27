@@ -318,10 +318,14 @@ function _M.wolf_rbac_access_check()
 
     local args = ngx.req.get_uri_args()
     local resName = args.resName
+    ngx.log(ngx.WARN, "wolf_rbac_access_check clientIP: ", args.clientIP or "")
     if resName == '/hello' or resName == '/wolf/rbac/custom/headers' then
         ngx.say(json_encode({ok=true,
                             data={ userInfo={nickname="administrator",
                                 username="admin", id="100"} }}))
+    elseif resName == '/hello/no_userinfo' then
+        -- authorized (200) but the backend returns no userInfo
+        ngx.say(json_encode({ok=true, data={}}))
     elseif resName == '/hello/500' then
         ngx.status = 500
         ngx.say(json_encode({ok=false, reason="ERR_SERVER_ERROR"}))
@@ -368,6 +372,26 @@ function _M.wolf_rbac_custom_headers()
 end
 
 
+-- send_close/send_pong return bytes, err; log a failure instead of silently
+-- dropping it, so a broken close/pong shows up in the fixture's error log.
+local function ws_send_close(wb, code, msg)
+    local bytes, err = wb:send_close(code, msg)
+    if not bytes then
+        ngx.log(ngx.ERR, "failed to send close frame: ", err)
+    end
+    return bytes, err
+end
+
+
+local function ws_send_pong(wb, data)
+    local bytes, err = wb:send_pong(data)
+    if not bytes then
+        ngx.log(ngx.ERR, "failed to send pong frame: ", err)
+    end
+    return bytes, err
+end
+
+
 function _M.websocket_handshake()
     local websocket = require "resty.websocket.server"
     local wb, err = websocket:new()
@@ -383,6 +407,407 @@ function _M.websocket_handshake()
     end
 end
 _M.websocket_handshake_route = _M.websocket_handshake
+
+
+-- Echoes every text/binary frame it receives back to the sender unchanged,
+-- so a fronting proxy's frame-level plugin hooks can be observed by diffing
+-- what the client sent against what it gets back. Used by the
+-- websocket-enhanced (ws/wss upstream scheme) test suite.
+function _M.websocket_echo()
+    local websocket = require "resty.websocket.server"
+    local wb, err = websocket:new()
+    if not wb then
+        ngx.log(ngx.ERR, "failed to new websocket: ", err)
+        return ngx.exit(400)
+    end
+
+    while true do
+        local data, typ, err = wb:recv_frame()
+        if not data then
+            if err and err:find("timeout", 1, true) then
+                goto continue
+            end
+            ngx.log(ngx.ERR, "failed to receive frame: ", err)
+            return
+        end
+
+        if typ == "close" then
+            ws_send_close(wb, 1000, "")
+            return
+        elseif typ == "ping" then
+            ws_send_pong(wb, data)
+        elseif typ == "text" or typ == "binary" then
+            local send = typ == "text" and wb.send_text or wb.send_binary
+            local bytes, send_err = send(wb, data)
+            if not bytes then
+                ngx.log(ngx.ERR, "failed to echo frame: ", send_err)
+                return
+            end
+        end
+
+        ::continue::
+    end
+end
+
+
+-- Like websocket_echo, but the node listening on 1981 refuses the handshake
+-- with a plain 503 instead: that node stays reachable at the TCP level, so an
+-- active tcp health check never marks it unhealthy on its own, while a
+-- websocket client sees a non-101 response and has to retry another node.
+function _M.websocket_echo_or_reject()
+    if ngx.var.server_port == "1981" then
+        return ngx.exit(503)
+    end
+
+    return _M.websocket_echo()
+end
+
+
+-- Like websocket_echo, but answers the handshake with the one subprotocol
+-- named by ?select=<name>, or with none at all for ?select=none (or no
+-- select), regardless of what the client offered. Falls into the same echo
+-- loop afterwards.
+function _M.websocket_subprotocol()
+    local select = ngx.var.arg_select
+    if select and select ~= "" and select ~= "none" then
+        ngx.req.set_header("Sec-WebSocket-Protocol", select)
+    else
+        ngx.req.clear_header("Sec-WebSocket-Protocol")
+    end
+
+    return _M.websocket_echo()
+end
+
+
+-- Like websocket_echo, but with a raised max_payload_len (and, through it,
+-- max_recv_len/max_send_len) so this fixture itself is never the bottleneck
+-- for a >64K single-frame test: whatever the test observes then comes from
+-- the proxy sitting in front of it, not from this fixture's own default.
+function _M.websocket_echo_large()
+    local websocket = require "resty.websocket.server"
+    local wb, err = websocket:new({max_payload_len = 4 * 1024 * 1024})
+    if not wb then
+        ngx.log(ngx.ERR, "failed to new websocket: ", err)
+        return ngx.exit(400)
+    end
+
+    while true do
+        local data, typ, err = wb:recv_frame()
+        if not data then
+            if err and err:find("timeout", 1, true) then
+                goto continue
+            end
+            ngx.log(ngx.ERR, "failed to receive frame: ", err)
+            return
+        end
+
+        if typ == "close" then
+            ws_send_close(wb, 1000, "")
+            return
+        elseif typ == "ping" then
+            ws_send_pong(wb, data)
+        elseif typ == "text" or typ == "binary" then
+            local send = typ == "text" and wb.send_text or wb.send_binary
+            local bytes, send_err = send(wb, data)
+            if not bytes then
+                ngx.log(ngx.ERR, "failed to echo frame: ", send_err)
+                return
+            end
+        end
+
+        ::continue::
+    end
+end
+
+
+-- Like websocket_echo_large, but replies to every text/binary frame with a
+-- short "received:<n>" ack instead of echoing the payload back, so a test
+-- can send a large frame in and only needs a large *receive* limit on the
+-- proxy in front of it, not also a large *send* limit for the reply.
+function _M.websocket_ack_large()
+    local websocket = require "resty.websocket.server"
+    local wb, err = websocket:new({max_payload_len = 4 * 1024 * 1024})
+    if not wb then
+        ngx.log(ngx.ERR, "failed to new websocket: ", err)
+        return ngx.exit(400)
+    end
+
+    while true do
+        local data, typ, err = wb:recv_frame()
+        if not data then
+            if err and err:find("timeout", 1, true) then
+                goto continue
+            end
+            ngx.log(ngx.ERR, "failed to receive frame: ", err)
+            return
+        end
+
+        if typ == "close" then
+            ws_send_close(wb, 1000, "")
+            return
+        elseif typ == "ping" then
+            ws_send_pong(wb, data)
+        elseif typ == "text" or typ == "binary" then
+            local bytes, send_err = wb:send_text("received:" .. #data)
+            if not bytes then
+                ngx.log(ngx.ERR, "failed to send ack: ", send_err)
+                return
+            end
+        end
+
+        ::continue::
+    end
+end
+
+
+-- Like websocket_echo_large, but pushes one large ("x" * 1MiB) text frame
+-- right after the handshake, unprompted, so a test can observe a large
+-- upstream-to-client message without also having to send a large one itself.
+-- Falls into the same echo loop afterwards.
+function _M.websocket_send_large()
+    local websocket = require "resty.websocket.server"
+    local wb, err = websocket:new({max_payload_len = 4 * 1024 * 1024})
+    if not wb then
+        ngx.log(ngx.ERR, "failed to new websocket: ", err)
+        return ngx.exit(400)
+    end
+
+    local bytes, send_err = wb:send_text(string.rep("x", 1024 * 1024))
+    if not bytes then
+        ngx.log(ngx.ERR, "failed to send large frame: ", send_err)
+        return
+    end
+
+    while true do
+        local data, typ, err = wb:recv_frame()
+        if not data then
+            if err and err:find("timeout", 1, true) then
+                goto continue
+            end
+            ngx.log(ngx.ERR, "failed to receive frame: ", err)
+            return
+        end
+
+        if typ == "close" then
+            ws_send_close(wb, 1000, "")
+            return
+        elseif typ == "ping" then
+            ws_send_pong(wb, data)
+        elseif typ == "text" or typ == "binary" then
+            local send = typ == "text" and wb.send_text or wb.send_binary
+            local ok, echo_err = send(wb, data)
+            if not ok then
+                ngx.log(ngx.ERR, "failed to echo frame: ", echo_err)
+                return
+            end
+        end
+
+        ::continue::
+    end
+end
+
+
+-- Like websocket_echo, but the first thing it sends back is a text frame
+-- carrying the request URI (with query string) it was actually dispatched
+-- with, so a test can confirm what path/query a fronting proxy forwarded.
+-- Falls into the same echo loop afterwards.
+function _M.websocket_echo_uri()
+    local websocket = require "resty.websocket.server"
+    local wb, err = websocket:new()
+    if not wb then
+        ngx.log(ngx.ERR, "failed to new websocket: ", err)
+        return ngx.exit(400)
+    end
+
+    local bytes, send_err = wb:send_text(ngx.var.request_uri)
+    if not bytes then
+        ngx.log(ngx.ERR, "failed to send request_uri: ", send_err)
+        return
+    end
+
+    while true do
+        local data, typ, recv_err = wb:recv_frame()
+        if not data then
+            if recv_err and recv_err:find("timeout", 1, true) then
+                goto continue
+            end
+            ngx.log(ngx.ERR, "failed to receive frame: ", recv_err)
+            return
+        end
+
+        if typ == "close" then
+            ws_send_close(wb, 1000, "")
+            return
+        elseif typ == "ping" then
+            ws_send_pong(wb, data)
+        elseif typ == "text" or typ == "binary" then
+            local send = typ == "text" and wb.send_text or wb.send_binary
+            local ok, echo_err = send(wb, data)
+            if not ok then
+                ngx.log(ngx.ERR, "failed to echo frame: ", echo_err)
+                return
+            end
+        end
+
+        ::continue::
+    end
+end
+
+
+-- Like websocket_echo, but the first thing it sends back is a text frame
+-- carrying the Host/X-Real-IP/X-Forwarded-For it actually received as JSON, so
+-- a test can confirm what a fronting proxy set them to. Falls into the same
+-- echo loop afterwards.
+function _M.websocket_echo_headers()
+    local websocket = require "resty.websocket.server"
+    local wb, err = websocket:new()
+    if not wb then
+        ngx.log(ngx.ERR, "failed to new websocket: ", err)
+        return ngx.exit(400)
+    end
+
+    local headers = ngx.req.get_headers()
+    local bytes, send_err = wb:send_text(json_encode({
+        host = headers["Host"],
+        x_real_ip = headers["X-Real-IP"],
+        x_forwarded_for = headers["X-Forwarded-For"],
+    }))
+    if not bytes then
+        ngx.log(ngx.ERR, "failed to send headers: ", send_err)
+        return
+    end
+
+    while true do
+        local data, typ, recv_err = wb:recv_frame()
+        if not data then
+            if recv_err and recv_err:find("timeout", 1, true) then
+                goto continue
+            end
+            ngx.log(ngx.ERR, "failed to receive frame: ", recv_err)
+            return
+        end
+
+        if typ == "close" then
+            ws_send_close(wb, 1000, "")
+            return
+        elseif typ == "ping" then
+            ws_send_pong(wb, data)
+        elseif typ == "text" or typ == "binary" then
+            local send = typ == "text" and wb.send_text or wb.send_binary
+            local ok, echo_err = send(wb, data)
+            if not ok then
+                ngx.log(ngx.ERR, "failed to echo frame: ", echo_err)
+                return
+            end
+        end
+
+        ::continue::
+    end
+end
+
+
+-- Sends one fragmented text message ("hello " + "world" as two continuation
+-- frames) right after the handshake, to verify a fronting proxy's
+-- aggregate_fragments option reassembles it into a single frame instead of
+-- forwarding (or invoking frame hooks on) two separate pieces.
+function _M.websocket_fragment()
+    local websocket = require "resty.websocket.server"
+    local wb, err = websocket:new()
+    if not wb then
+        ngx.log(ngx.ERR, "failed to new websocket: ", err)
+        return ngx.exit(400)
+    end
+
+    local ok, send_err = wb:send_frame(false, 0x1, "hello ")
+    if not ok then
+        ngx.log(ngx.ERR, "failed to send first fragment: ", send_err)
+        return
+    end
+
+    ok, send_err = wb:send_frame(true, 0x0, "world")
+    if not ok then
+        ngx.log(ngx.ERR, "failed to send final fragment: ", send_err)
+        return
+    end
+
+    -- drain until the client closes, so the connection doesn't just vanish
+    -- out from under the proxy mid-test
+    while true do
+        local data, typ, recv_err = wb:recv_frame()
+        if not data then
+            if recv_err and recv_err:find("timeout", 1, true) then
+                goto continue
+            end
+            return
+        end
+        if typ == "close" then
+            ws_send_close(wb, 1000, "")
+            return
+        end
+        ::continue::
+    end
+end
+
+
+-- Sends a close frame of its own right after the handshake, without waiting
+-- for the client to initiate one, to exercise an upstream-initiated close.
+function _M.websocket_close_upstream_initiated()
+    local websocket = require "resty.websocket.server"
+    local wb, err = websocket:new()
+    if not wb then
+        ngx.log(ngx.ERR, "failed to new websocket: ", err)
+        return ngx.exit(400)
+    end
+
+    ws_send_close(wb, 1000, "bye")
+end
+
+
+-- Completes the handshake, echoes exactly one frame, then vanishes without
+-- sending a close frame, to simulate an upstream that dies mid-session
+-- instead of closing cleanly.
+function _M.websocket_abrupt_close()
+    local websocket = require "resty.websocket.server"
+    local wb, err = websocket:new()
+    if not wb then
+        ngx.log(ngx.ERR, "failed to new websocket: ", err)
+        return ngx.exit(400)
+    end
+
+    local data, typ = wb:recv_frame()
+    if data and (typ == "text" or typ == "binary") then
+        local send = typ == "text" and wb.send_text or wb.send_binary
+        send(wb, data)
+    end
+
+    -- returning here, with the connection already hijacked by
+    -- resty.websocket.server, drops the raw TCP connection without a
+    -- close handshake
+end
+
+
+-- keep the session open until the peer goes away, so that the request stays in
+-- flight in the balancer the way a real WebSocket session does. An idle timeout is
+-- the normal state of such a session, not an error: keep waiting, and only give up
+-- once the peer closes or the connection breaks
+function _M.websocket_hold()
+    local websocket = require "resty.websocket.server"
+    local wb, err = websocket:new({timeout = 30000})
+    if not wb then
+        ngx.log(ngx.ERR, "failed to new websocket: ", err)
+        return ngx.exit(400)
+    end
+
+    while true do
+        local _, typ, err = wb:recv_frame()
+        if typ == "close" then
+            return
+        end
+        if not typ and not string.find(err or "", "timeout", 1, true) then
+            return
+        end
+    end
+end
 
 
 function _M.api_breaker()
@@ -412,6 +837,22 @@ function _M.print_uri_detailed()
     ngx.say("ngx.var.request_uri: ", ngx.var.request_uri)
 end
 
+-- echo back exactly what the upstream received: the full request URI (with
+-- query string) and every request header. Lets tests assert on what was
+-- actually proxied upstream instead of scanning the error log.
+function _M.print_request_received()
+    ngx.say("request_uri: ", ngx.var.request_uri)
+    local headers = ngx.req.get_headers()
+    local keys = {}
+    for k in pairs(headers) do
+        keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    for _, k in ipairs(keys) do
+        ngx.say(k, ": ", headers[k])
+    end
+end
+
 function _M.headers()
     local args = ngx.req.get_uri_args()
     for name, val in pairs(args) do
@@ -431,6 +872,8 @@ function _M.echo()
     end
     ngx.print(ngx.req.get_body_data() or "")
 end
+
+_M.v1_responses = _M.echo
 
 
 function _M.log()
@@ -475,6 +918,20 @@ function _M._well_known_openid_configuration()
     local t = require("lib.test_admin")
     local openid_data = t.read_file("t/plugin/openid-connect/configuration.json")
     ngx.say(openid_data)
+end
+
+-- Same discovery document but advertising an end_session_endpoint, so the
+-- openid-connect logout flow can be exercised without reaching a live provider.
+function _M._well_known_openid_configuration_with_end_session()
+    local t = require("lib.test_admin")
+    local openid_data = json_decode(t.read_file("t/plugin/openid-connect/configuration.json"))
+    if not openid_data then
+        ngx.status = 500
+        ngx.say("failed to decode openid discovery fixture")
+        return
+    end
+    openid_data.end_session_endpoint = "https://samples.auth0.com/v2/logout"
+    ngx.say(json_encode(openid_data))
 end
 
 function _M.google_logging_token()
@@ -751,9 +1208,466 @@ function _M.plugin_proxy_rewrite_resp_header()
     ngx.say(s)
 end
 
+-- AI fixture endpoints: serve mock responses from t/fixtures/ files.
+-- Tests specify the fixture via the X-AI-Fixture request header.
+-- If the header is absent, a 400 error is returned.
+
+local function ai_fixture_dispatch()
+    require("lib.fixture_loader").dispatch()
+end
+
+function _M.v1_chat_completions()
+    local json = require("cjson.safe")
+    local fixture = ngx.req.get_headers()["x-ai-fixture"]
+
+    if fixture then
+        local test_type = ngx.req.get_headers()["test-type"]
+        if test_type then
+            ngx.req.read_body()
+            local body = json.decode(ngx.req.get_body_data() or "")
+
+            if test_type == "system-prompt" then
+                local first = body and body.messages and body.messages[1]
+                if not first or first.role ~= "system" then
+                    ngx.status = 400
+                    ngx.say([[{"error":"system message not converted"}]])
+                    return
+                end
+            elseif test_type == "tools" then
+                local tool = body and body.tools and body.tools[1]
+                if not tool or tool.type ~= "function"
+                   or not tool["function"] or tool["function"].name ~= "get_weather" then
+                    ngx.status = 400
+                    ngx.say([[{"error":"tool not converted to openai format"}]])
+                    return
+                end
+            elseif test_type == "vertex-embeddings" then
+                if not body or not body.instances or not body.instances[1]
+                   or not body.instances[1].content then
+                    ngx.status = 400
+                    ngx.say([[{"error":"vertex instances format missing"}]])
+                    return
+                end
+            end
+        end
+
+        ai_fixture_dispatch()
+        return
+    end
+
+    local header_auth = ngx.req.get_headers()["authorization"]
+    local query_auth = ngx.req.get_uri_args()["api_key"]
+    local test_type = ngx.req.get_headers()["test-type"]
+
+    -- options check: verify model options are merged into request body
+    if test_type == "options" then
+        ngx.req.read_body()
+        local body = json.decode(ngx.req.get_body_data() or "")
+        if body and body.foo == "bar" then
+            ngx.print("options works")
+        else
+            ngx.status = 500
+            ngx.say("model options feature doesn't work")
+        end
+        return
+    end
+
+    -- header forwarding: echo all received headers as JSON
+    if test_type == "header_forwarding" then
+        ngx.say(json.encode(ngx.req.get_headers()))
+        return
+    end
+
+    -- auth check
+    local args = ngx.req.get_uri_args()
+    ngx.log(ngx.INFO, "found query params: ",
+            json.encode(args))
+    if header_auth ~= "Bearer token" and query_auth ~= "apikey" then
+        ngx.status = 401
+        ngx.say("Unauthorized")
+        return
+    end
+
+    -- default: message echo (for ai-request-rewrite prompt tests)
+    ngx.req.read_body()
+    local body = ngx.req.get_body_data()
+    body = json.decode(body)
+    if not body or not body.messages or #body.messages < 1 then
+        ngx.status = 400
+        ngx.say([[{"error":"bad request"}]])
+        return
+    end
+    local parts = {}
+    for _, msg in ipairs(body.messages) do
+        if msg.content then
+            table.insert(parts, msg.content)
+        end
+    end
+    local content = table.concat(parts, " ")
+    ngx.say(json.encode({
+        choices = {{message = {content = content}}}
+    }))
+end
+
+function _M.v1_messages()
+    ai_fixture_dispatch()
+end
+
+function _M.v1_embeddings()
+    ai_fixture_dispatch()
+end
+
+function _M.v1_images_generations()
+    if ngx.req.get_headers()["x-ai-fixture"] then
+        ai_fixture_dispatch()
+        return
+    end
+    ngx.req.read_body()
+    ngx.header["Content-Type"] = "application/json"
+    ngx.print(ngx.req.get_body_data() or "{}")
+end
+
+function _M.v1_responses()
+    if ngx.req.get_headers()["x-ai-fixture"] then
+        ngx.req.read_body()
+        local json = require("cjson.safe")
+        local body = json.decode(ngx.req.get_body_data() or "")
+        if body and body.stream_options then
+            ngx.status = 400
+            ngx.say([[{"error":"stream_options must not be injected for Responses API"}]])
+            return
+        end
+        ai_fixture_dispatch()
+        return
+    end
+    -- fallback to echo for non-fixture tests (e.g., ai-prompt-guard)
+    _M.echo()
+end
+
+function _M.delay_v1_chat_completions()
+    ngx.sleep(2)
+    ai_fixture_dispatch()
+end
+
+function _M.random()
+    ngx.header["Content-Type"] = "application/json"
+    ngx.say([[{"choices":[{"message":{"content":"path override works"}}]}]])
+end
+
+-- Health check probe endpoint for AI proxy tests.
+function _M.status_gpt4()
+    ngx.say("ok")
+end
+
+-- Aliyun content moderation mock: checks request body for "kill" keyword
+-- and returns the appropriate risk/safe fixture response.
+function _M.aliyun_moderation()
+    ngx.req.read_body()
+    local body = ngx.req.get_body_data() or ""
+    local fixture_loader = require("lib.fixture_loader")
+    local fixture_name
+    if body:find("kill") then
+        fixture_name = "aliyun/moderation-risk.json"
+    else
+        fixture_name = "aliyun/moderation-safe.json"
+    end
+    local content, err = fixture_loader.load(fixture_name)
+    if not content then
+        ngx.status = 500
+        ngx.say(err)
+        return
+    end
+    ngx.header["Content-Type"] = "application/json"
+    ngx.print(content)
+end
+
+-- Bedrock Converse mock: validates SigV4 headers (algorithm, credential
+-- scope, signed headers, signature length, X-Amz-Date format) and the
+-- request body shape (no `model` field, has `messages`), then serves a
+-- canned response. If the SigV4 signer attached x-amz-security-token, the
+-- token is echoed back in the assistant text so tests can assert
+-- auth.aws.session_token end-to-end.
+function _M.bedrock_converse()
+    local json = require("cjson.safe")
+
+    -- Log raw request URI so tests can assert path encoding (e.g., that ARN
+    -- model IDs are URL-encoded as a single path segment).
+    ngx.log(ngx.WARN, "[test] received uri: ", ngx.var.request_uri)
+
+    if ngx.req.get_method() ~= "POST" then
+        ngx.status = 400
+        ngx.say("Unsupported request method: ", ngx.req.get_method())
+        return
+    end
+
+    local headers = ngx.req.get_headers()
+    local auth_header = headers["authorization"]
+    local amz_date = headers["x-amz-date"]
+    if not auth_header or not amz_date then
+        ngx.status = 403
+        ngx.say(json.encode({message = "Missing Authentication Token"}))
+        return
+    end
+
+    if not auth_header:match("^AWS4%-HMAC%-SHA256 ") then
+        ngx.status = 403
+        ngx.say(json.encode({
+            message = "Authorization header missing AWS4-HMAC-SHA256 algorithm prefix"
+        }))
+        return
+    end
+
+    -- Strict credential scope: access_key/<date>/us-east-1/bedrock/aws4_request
+    if not auth_header:match(
+        "Credential=AKIAIOSFODNN7EXAMPLE/%d%d%d%d%d%d%d%d/us%-east%-1/bedrock/aws4_request"
+    ) then
+        ngx.status = 403
+        ngx.say(json.encode({
+            message = "Authorization Credential scope does not match expected "
+                .. "AKIAIOSFODNN7EXAMPLE/<DATE>/us-east-1/bedrock/aws4_request"
+        }))
+        return
+    end
+
+    if not auth_header:match("SignedHeaders=[^,]+") then
+        ngx.status = 403
+        ngx.say(json.encode({
+            message = "Authorization header missing SignedHeaders component"
+        }))
+        return
+    end
+
+    -- Lua patterns don't support {n} quantifiers, so match exactly 64 hex
+    -- chars by repeating %x sixty-four times.
+    local hex64 = string.rep("%x", 64)
+    if not auth_header:match("Signature=" .. hex64) then
+        ngx.status = 403
+        ngx.say(json.encode({
+            message = "Authorization Signature is missing or not 64 hex chars"
+        }))
+        return
+    end
+
+    if not amz_date:match("^%d%d%d%d%d%d%d%dT%d%d%d%d%d%dZ$") then
+        ngx.status = 403
+        ngx.say(json.encode({
+            message = "X-Amz-Date header does not match YYYYMMDDTHHMMSSZ format"
+        }))
+        return
+    end
+
+    ngx.req.read_body()
+    local body, err = json.decode(ngx.req.get_body_data() or "")
+    if not body then
+        ngx.status = 400
+        ngx.say(json.encode({message = "Invalid JSON: " .. (err or "")}))
+        return
+    end
+
+    -- remove_model = true: bedrock provider must strip `model` from body.
+    if body.model then
+        ngx.status = 400
+        ngx.say(json.encode({
+            message = "model field should not be in request body"
+        }))
+        return
+    end
+
+    if not body.messages or #body.messages < 1 then
+        ngx.status = 400
+        ngx.say(json.encode({message = "messages is required"}))
+        return
+    end
+
+    local fixture_loader = require("lib.fixture_loader")
+    local content, ferr = fixture_loader.load(
+        ngx.req.get_headers()["X-AI-Fixture"] or "bedrock/converse-basic.json")
+    if not content then
+        ngx.status = 500
+        ngx.say(ferr)
+        return
+    end
+
+    local session_token = headers["x-amz-security-token"]
+    if session_token then
+        local response = json.decode(content)
+        local text = response.output.message.content[1].text
+        response.output.message.content[1].text = text
+            .. " session_token_seen=" .. session_token
+        content = json.encode(response)
+    end
+
+    ngx.header["Content-Type"] = "application/json"
+    ngx.print(content)
+end
+
+
+-- Mock for Bedrock /converse-stream. Reuses the same SigV4 + body shape
+-- validation as bedrock_converse(), then serves the recorded EventStream
+-- binary fixture so streaming tests can assert end-to-end framing,
+-- response-text aggregation, and token-usage extraction.
+function _M.bedrock_converse_stream()
+    local json = require("cjson.safe")
+
+    ngx.log(ngx.WARN, "[test] received uri: ", ngx.var.request_uri)
+
+    if ngx.req.get_method() ~= "POST" then
+        ngx.status = 400
+        ngx.say("Unsupported request method: ", ngx.req.get_method())
+        return
+    end
+
+    local headers = ngx.req.get_headers()
+    local auth_header = headers["authorization"]
+    local amz_date = headers["x-amz-date"]
+    if not auth_header or not amz_date then
+        ngx.status = 403
+        ngx.say(json.encode({message = "Missing Authentication Token"}))
+        return
+    end
+
+    if not auth_header:match("^AWS4%-HMAC%-SHA256 ") then
+        ngx.status = 403
+        ngx.say(json.encode({
+            message = "Authorization header missing AWS4-HMAC-SHA256 algorithm prefix"
+        }))
+        return
+    end
+
+    if not auth_header:match(
+        "Credential=AKIAIOSFODNN7EXAMPLE/%d%d%d%d%d%d%d%d/us%-east%-1/bedrock/aws4_request"
+    ) then
+        ngx.status = 403
+        ngx.say(json.encode({
+            message = "Authorization Credential scope does not match expected "
+                .. "AKIAIOSFODNN7EXAMPLE/<DATE>/us-east-1/bedrock/aws4_request"
+        }))
+        return
+    end
+
+    local hex64 = string.rep("%x", 64)
+    if not auth_header:match("Signature=" .. hex64) then
+        ngx.status = 403
+        ngx.say(json.encode({
+            message = "Authorization Signature is missing or not 64 hex chars"
+        }))
+        return
+    end
+
+    if not amz_date:match("^%d%d%d%d%d%d%d%dT%d%d%d%d%d%dZ$") then
+        ngx.status = 403
+        ngx.say(json.encode({
+            message = "X-Amz-Date header does not match YYYYMMDDTHHMMSSZ format"
+        }))
+        return
+    end
+
+    ngx.req.read_body()
+    local body, err = json.decode(ngx.req.get_body_data() or "")
+    if not body then
+        ngx.status = 400
+        ngx.say(json.encode({message = "Invalid JSON: " .. (err or "")}))
+        return
+    end
+
+    -- Bedrock decides streaming purely by URL; the gateway must strip its
+    -- internal `stream` flag from the body before forwarding.
+    if body.stream ~= nil then
+        ngx.status = 400
+        ngx.say(json.encode({
+            message = "stream field should not be in request body for /converse-stream"
+        }))
+        return
+    end
+
+    if body.model then
+        ngx.status = 400
+        ngx.say(json.encode({
+            message = "model field should not be in request body"
+        }))
+        return
+    end
+
+    if not body.messages or #body.messages < 1 then
+        ngx.status = 400
+        ngx.say(json.encode({message = "messages is required"}))
+        return
+    end
+
+    local fixture_loader = require("lib.fixture_loader")
+    local content, ferr = fixture_loader.load(
+        ngx.req.get_headers()["X-AI-Fixture"] or "bedrock/bedrock-converse-streaming.bin")
+    if not content then
+        ngx.status = 500
+        ngx.say(ferr)
+        return
+    end
+
+    ngx.header["Content-Type"] = "application/vnd.amazon.eventstream"
+    ngx.header["Cache-Control"] = "no-cache"
+    ngx.header["Transfer-Encoding"] = "chunked"
+    ngx.print(content)
+    ngx.flush(true)
+end
+
+
+-- Error endpoints for ai-request-rewrite tests.
+function _M.bad_request()
+    ngx.status = 400
+    ngx.say("Bad Request")
+end
+
+function _M.internalservererror()
+    ngx.status = 500
+    ngx.say("Internal Server Error")
+end
+
+-- Endpoint that validates extra_option in request body for ai-request-rewrite2 tests.
+function _M.check_extra_options()
+    ngx.req.read_body()
+    local body = ngx.req.get_body_data()
+    local json = require("cjson.safe")
+    local data = json.decode(body)
+    if not data or data.extra_option ~= "extra option" then
+        ngx.status = 400
+        ngx.say("extra option not match")
+        return
+    end
+    local response = json.encode({choices = {{message = {content = "ok"}}}})
+    ngx.say(response)
+end
+
+-- Endpoint that validates query params for ai-request-rewrite2 tests.
+function _M.test_params_in_overridden_endpoint()
+    local args = ngx.req.get_uri_args()
+    if args["api_key"] ~= "apikey" then
+        ngx.status = 401
+        ngx.say("Unauthorized")
+        return
+    end
+    ngx.say("passed")
+end
+
+
 -- Please add your fake upstream above
 function _M.go()
-    local action = string.sub(ngx.var.uri, 2)
+    local uri = ngx.var.uri
+
+    -- Bedrock Converse API: /model/<model>/converse(-stream) where <model>
+    -- can contain ':' and percent-encoded sequences (URL-encoded ARNs),
+    -- which the path-to-function-name conversion below can't represent.
+    -- Dispatch directly. Match streaming first since /converse is a suffix
+    -- of /converse-stream.
+    if uri:match("^/model/.+/converse%-stream$") then
+        inject_headers()
+        return _M.bedrock_converse_stream()
+    end
+    if uri:match("^/model/.+/converse$") then
+        inject_headers()
+        return _M.bedrock_converse()
+    end
+
+    local action = string.sub(uri, 2)
     action = string.gsub(action, "[/\\.-]", "_")
     if not action or not _M[action] then
         ngx.log(ngx.WARN, "undefined path in test server, uri: ", ngx.var.request_uri)
@@ -781,6 +1695,168 @@ function _M.mock_compressed_upstream_response()
     local s = "compressed_response"
     ngx.header['Content-Encoding'] = 'gzip'
     ngx.say(s)
+end
+
+
+-- Mock GraphQL upstream for graphql-limit-count: the same endpoint answers both
+-- the schema introspection query and normal queries, which is how the plugin
+-- derives the introspection endpoint when introspection_endpoint is not set.
+local function gql_named(kind, name)
+    return {kind = kind, name = name}
+end
+-- NON_NULL(LIST(OBJECT)) -- exercises the wrapper unwrapping in introspection.lua
+local function gql_list_of(name)
+    return {
+        kind = "NON_NULL",
+        ofType = {kind = "LIST", ofType = gql_named("OBJECT", name)},
+    }
+end
+local function gql_field(name, type_ref, args)
+    -- `args` is a GraphQL list: omit it rather than let an empty Lua table
+    -- serialize as `{}`, which is not a valid introspection argument list
+    return {name = name, type = type_ref, args = args}
+end
+local function gql_first_arg(default_value)
+    return {{name = "first", defaultValue = default_value,
+             type = gql_named("SCALAR", "Int")}}
+end
+
+local gql_string = gql_named("SCALAR", "String")
+local gql_id = gql_named("SCALAR", "ID")
+
+local gql_introspection_response = json_encode({
+    data = {
+        __schema = {
+            queryType = {name = "Query"},
+            mutationType = {name = "Mutation"},
+            types = {
+                {kind = "OBJECT", name = "Query", fields = {
+                    gql_field("products", gql_named("OBJECT", "ProductConnection"),
+                              gql_first_arg()),
+                    -- `first` has a schema default: only counted with resolve_variables
+                    gql_field("topProducts", gql_named("OBJECT", "ProductConnection"),
+                              gql_first_arg("25")),
+                }},
+                {kind = "OBJECT", name = "ProductConnection", fields = {
+                    gql_field("nodes", gql_list_of("Product")),
+                }},
+                {kind = "OBJECT", name = "Product", fields = {
+                    gql_field("id", gql_id),
+                    gql_field("name", gql_string),
+                    gql_field("reviews", gql_named("OBJECT", "ReviewConnection"),
+                              gql_first_arg()),
+                }},
+                {kind = "OBJECT", name = "ReviewConnection", fields = {
+                    gql_field("nodes", gql_list_of("Review")),
+                }},
+                {kind = "OBJECT", name = "Review", fields = {
+                    gql_field("id", gql_id),
+                    gql_field("body", gql_string),
+                    gql_field("author", gql_named("OBJECT", "User")),
+                }},
+                {kind = "OBJECT", name = "User", fields = {
+                    gql_field("name", gql_string),
+                    gql_field("orders", gql_named("OBJECT", "OrderConnection"),
+                              gql_first_arg()),
+                }},
+                {kind = "OBJECT", name = "OrderConnection", fields = {
+                    gql_field("nodes", gql_list_of("Order")),
+                }},
+                {kind = "OBJECT", name = "Order", fields = {
+                    gql_field("id", gql_id),
+                }},
+            },
+        },
+    },
+})
+
+
+function _M.graphql()
+    ngx.req.read_body()
+    local body = ngx.req.get_body_data() or ""
+
+    ngx.header["Content-Type"] = "application/json"
+    if string.find(body, "__schema", 1, true) then
+        ngx.print(gql_introspection_response)
+        return
+    end
+
+    ngx.print('{"data":{"ok":true}}')
+end
+
+
+_M.graphql_alt = _M.graphql
+_M.graphql_plain = _M.graphql
+-- two routes proxying to one upstream, to assert that two services which
+-- share an introspection endpoint do not share its cached schema
+_M.graphql_shared_a = _M.graphql
+_M.graphql_shared_b = _M.graphql
+
+
+-- An upstream that requires credentials to introspect. The plugin must send the
+-- operator's configured credentials and nothing taken from the caller: a schema
+-- cached per service cannot be fetched with per-caller identity.
+function _M.graphql_guarded()
+    ngx.req.read_body()
+    local body = ngx.req.get_body_data() or ""
+
+    if string.find(body, "__schema", 1, true) then
+        if ngx.var.http_authorization ~= "Bearer operator-token" then
+            ngx.status = 401
+            ngx.header["Content-Type"] = "application/json"
+            ngx.print('{"errors":[{"message":"introspection requires credentials"}]}')
+            return
+        end
+
+        ngx.header["Content-Type"] = "application/json"
+        ngx.print(gql_introspection_response)
+        return
+    end
+
+    ngx.header["Content-Type"] = "application/json"
+    ngx.print('{"data":{"ok":true}}')
+end
+
+
+-- An upstream whose introspection endpoint is unusable, to assert the 400 path.
+function _M.graphql_broken()
+    ngx.req.read_body()
+    ngx.header["Content-Type"] = "application/json"
+    ngx.status = 500
+    ngx.print('{"errors":[{"message":"introspection disabled"}]}')
+end
+
+
+-- proxied path always fails, so a working cost proves introspection went to the
+-- configured introspection_endpoint instead of the request path
+_M.graphql_explicit = _M.graphql_broken
+
+
+-- echo received request headers, emitting one line per occurrence so that
+-- same-name (multi-value) headers are distinguishable from a single
+-- comma-joined value. A genuine multi-value header arrives as a table from
+-- ngx.req.get_headers() and is printed as repeated "name: value" lines.
+function _M.plugin_proxy_rewrite_multi_header()
+    local headers = ngx.req.get_headers()
+
+    local keys = {}
+    for k in pairs(headers) do
+        if not builtin_hdr_ignore_list[k] then
+            table.insert(keys, k)
+        end
+    end
+    table.sort(keys)
+
+    for _, key in ipairs(keys) do
+        local v = headers[key]
+        if type(v) == "table" then
+            for _, item in ipairs(v) do
+                ngx.say(key, ": ", item)
+            end
+        else
+            ngx.say(key, ": ", v)
+        end
+    end
 end
 
 

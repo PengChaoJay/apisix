@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-FROM debian:bullseye-slim AS build
+FROM debian:bookworm-slim AS build
 
 ARG ENABLE_PROXY=false
 ARG CODE_PATH
@@ -32,21 +32,32 @@ RUN set -x \
         make \
         git  \
         sudo \
+        ca-certificates \
+        curl \
+        gcc \
+        g++ \
+        cmake \
         libyaml-dev \
+        libxml2-dev \
+        libxslt1-dev \
+        pkg-config \
+        libssl-dev \
+        zlib1g-dev \
+        xz-utils \
     && ls -al \
     && make deps \
     && mkdir -p ${ENV_INST_LUADIR} \
     && cp -r deps ${ENV_INST_LUADIR} \
     && make install
 
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 ARG ENTRYPOINT_PATH=./docker-entrypoint.sh
 ARG INSTALL_BROTLI=./install-brotli.sh
 
 # Install the runtime libyaml package
 RUN apt-get -y update --fix-missing \
-    && apt-get install -y libldap2-dev libyaml-0-2 \
+    && apt-get install -y libldap2-dev libyaml-0-2 libxml2 libxslt1.1 libpcre3 \
     && apt-get remove --purge --auto-remove -y \
     && mkdir -p /usr/local/apisix/ui
 

@@ -20,6 +20,7 @@ local core              = require("apisix.core")
 local priority_balancer = require("apisix.balancer.priority")
 local apisix_upstream   = require("apisix.upstream")
 local healthcheck_manager = require("apisix.healthcheck_manager")
+local slow_start        = require("apisix.slow_start")
 local ipairs            = ipairs
 local is_http           = ngx.config.subsystem == "http"
 local enable_keepalive = balancer.enable_keepalive and is_http
@@ -27,11 +28,16 @@ local set_more_tries   = balancer.set_more_tries
 local get_last_failure = balancer.get_last_failure
 local set_timeouts     = balancer.set_timeouts
 local ngx_now          = ngx.now
+local ngx_md5          = ngx.md5
+local tostring         = tostring
 
 local module_name = "balancer"
 local pickers = {}
 
 local lrucache_server_picker = core.lrucache.new({
+    ttl = 300, count = 256
+})
+local lrucache_health_status = core.lrucache.new({
     ttl = 300, count = 256
 })
 local lrucache_addr = core.lrucache.new({
@@ -45,7 +51,7 @@ local _M = {
 }
 
 
-local function transform_node(new_nodes, node)
+local function transform_node(new_nodes, node, weight)
     if not new_nodes._priority_index then
         new_nodes._priority_index = {}
     end
@@ -55,43 +61,90 @@ local function transform_node(new_nodes, node)
         core.table.insert(new_nodes._priority_index, node.priority)
     end
 
-    new_nodes[node.priority][node.host .. ":" .. node.port] = node.weight
+    new_nodes[node.priority][node.host .. ":" .. node.port] = weight or node.weight
     return new_nodes
 end
 
 
-local function fetch_health_nodes(upstream, checker)
-    local nodes = upstream.nodes
-    if not checker then
-        local new_nodes = core.table.new(0, #nodes)
-        for _, node in ipairs(nodes) do
-            new_nodes = transform_node(new_nodes, node)
-        end
-        return new_nodes
+-- `weights` carries the slow start weight of every node, indexed like `nodes`;
+-- without it each node keeps its configured weight
+local function transform_nodes(nodes, weights)
+    local new_nodes = core.table.new(0, #nodes)
+    for i, node in ipairs(nodes) do
+        new_nodes = transform_node(new_nodes, node, weights and weights[i])
     end
+    return new_nodes
+end
 
+
+local function create_health_status(upstream, checker)
+    local nodes = upstream.nodes
     local host = upstream.checks and upstream.checks.active and upstream.checks.active.host
     local port = upstream.checks and upstream.checks.active and upstream.checks.active.port
-    local up_nodes = core.table.new(0, #nodes)
+    local health_status = core.table.new(0, #nodes)
+    local has_healthy_node = false
+
     for _, node in ipairs(nodes) do
         local ok, err = healthcheck_manager.fetch_node_status(checker,
                                              node.host, port or node.port, host)
+        local addr = node.host .. ":" .. node.port
         if ok then
-            up_nodes = transform_node(up_nodes, node)
-        elseif err then
-            core.log.warn("failed to get health check target status, addr: ",
-                node.host, ":", port or node.port, ", host: ", host, ", err: ", err)
+            health_status[addr] = true
+            has_healthy_node = true
+        else
+            health_status[addr] = false
+            if err then
+                core.log.warn("failed to get health check target status, addr: ",
+                    node.host, ":", port or node.port, ", host: ", host, ", err: ", err)
+            end
         end
     end
 
-    if core.table.nkeys(up_nodes) == 0 then
+    if not has_healthy_node then
         core.log.warn("all upstream nodes is unhealthy, use default")
-        for _, node in ipairs(nodes) do
-            up_nodes = transform_node(up_nodes, node)
+        return {all_unhealthy = true}
+    end
+
+    return {status = health_status}
+end
+
+
+-- The nodes that actually reach the picker, reusing create_health_status so the
+-- per-node health lookup lives in exactly one place. When every node is unhealthy
+-- the whole set is kept, which is the existing fail-open behaviour.
+local function fetch_eligible_nodes(upstream, checker)
+    if not checker then
+        return upstream.nodes
+    end
+
+    local health_status = create_health_status(upstream, checker)
+    if health_status.all_unhealthy then
+        return upstream.nodes
+    end
+
+    local nodes = core.table.new(#upstream.nodes, 0)
+    for _, node in ipairs(upstream.nodes) do
+        if health_status.status[node.host .. ":" .. node.port] then
+            core.table.insert(nodes, node)
         end
     end
 
-    return up_nodes
+    return nodes
+end
+
+
+local function fetch_health_status(upstream, checker, key, version)
+    if not checker then
+        return nil
+    end
+
+    local health_status = lrucache_health_status(key, version .. "#" .. checker.status_ver,
+                                                 create_health_status, upstream, checker)
+    if not health_status or health_status.all_unhealthy then
+        return nil
+    end
+
+    return health_status.status
 end
 
 
@@ -112,7 +165,15 @@ local function create_server_picker(upstream, checker)
             end
         end
 
-        local up_nodes = fetch_health_nodes(upstream, checker)
+        local up_nodes
+        if upstream.type == "chash" then
+            up_nodes = transform_nodes(upstream.nodes)
+        else
+            -- slow start runs on the eligible set, so a node only starts its ramp
+            -- once it can actually be picked
+            local nodes = fetch_eligible_nodes(upstream, checker)
+            up_nodes = transform_nodes(nodes, slow_start.effective_weights(upstream, nodes))
+        end
 
         if #up_nodes._priority_index > 1 then
             core.log.info("upstream nodes: ", core.json.delay_encode(up_nodes))
@@ -121,9 +182,9 @@ local function create_server_picker(upstream, checker)
             return server_picker
         end
 
-        core.log.info("upstream nodes: ",
-                      core.json.delay_encode(up_nodes[up_nodes._priority_index[1]]))
-        local server_picker = picker.new(up_nodes[up_nodes._priority_index[1]], upstream)
+        local priority = up_nodes._priority_index[1]
+        core.log.info("upstream nodes: ", core.json.delay_encode(up_nodes[priority]))
+        local server_picker = picker.new(up_nodes[priority], upstream, priority)
         server_picker.addr_to_domain = addr_to_domain
         return server_picker
     end
@@ -188,17 +249,52 @@ local function parse_server_for_upstream_host(picked_server, upstream_scheme)
 end
 
 
+-- reports a connection outcome (get_last_failure()-shaped state/code) for the
+-- node ctx.balancer_ip/balancer_port currently point at
+local function report_failure(ctx, checker, up_conf, state, code)
+    local host = up_conf.checks and up_conf.checks.active and up_conf.checks.active.host
+    local port = up_conf.checks and up_conf.checks.active and up_conf.checks.active.port
+    if state == "failed" then
+        if code == 504 then
+            checker:report_timeout(ctx.balancer_ip, port or ctx.balancer_port, host)
+        else
+            checker:report_tcp_failure(ctx.balancer_ip, port or ctx.balancer_port, host)
+        end
+    else
+        checker:report_http_status(ctx.balancer_ip, port or ctx.balancer_port, host, code)
+    end
+end
+
+
 -- pick_server will be called:
 -- 1. in the access phase so that we can set headers according to the picked server
 -- 2. each time we need to retry upstream
-local function pick_server(route, ctx)
+--
+-- prev_failure, when given, overrides get_last_failure() for callers outside
+-- balancer_by_lua* that already know their own connection's outcome.
+local function pick_server(route, ctx, prev_failure)
     local up_conf = ctx.upstream_conf
 
     local nodes_count = #up_conf.nodes
-    if nodes_count == 1 then
+    -- least_conn counts the in-flight connections of every request it routes, so it
+    -- has to see them even while the upstream has a single node: those connections
+    -- are what tells a later scale out that the node is not empty. Skipping the
+    -- balancer here would leave it blind to everything routed before the second
+    -- node showed up, which is the state a k8s deployment or a discovery service
+    -- starts from. See #12217
+    --
+    -- Slow start is in the same position: the node set of a single node upstream
+    -- is what the second node is later compared against, and only the picker build
+    -- records it. The node still takes every request either way.
+    if nodes_count == 1 and up_conf.type ~= "least_conn" and not up_conf.warm_up_conf then
         local node = up_conf.nodes[1]
         ctx.balancer_ip = node.host
         ctx.balancer_port = node.port
+        ctx.upstream_unresolved_host = node.domain or node.host
+        -- also expose it as an nginx var so it can be used in the access log (http only)
+        if is_http and ctx.var then
+            ctx.var.upstream_unresolved_host = ctx.upstream_unresolved_host
+        end
         node.upstream_host = parse_server_for_upstream_host(node, ctx.upstream_scheme)
         return node
     end
@@ -210,27 +306,34 @@ local function pick_server(route, ctx)
     ctx.balancer_try_count = (ctx.balancer_try_count or 0) + 1
     if ctx.balancer_try_count > 1 then
         if ctx.server_picker and ctx.server_picker.after_balance then
-            ctx.server_picker.after_balance(ctx, true)
+            -- remembering the server as tried is what keeps the next pick off it, so
+            -- only do it when there is another one to move to. With a single node the
+            -- retry has to land on it again, the way the fast path below always did
+            ctx.server_picker.after_balance(ctx, nodes_count > 1)
         end
 
         if checker then
-            local state, code = get_last_failure()
-            local host = up_conf.checks and up_conf.checks.active and up_conf.checks.active.host
-            local port = up_conf.checks and up_conf.checks.active and up_conf.checks.active.port
-            if state == "failed" then
-                if code == 504 then
-                    checker:report_timeout(ctx.balancer_ip, port or ctx.balancer_port, host)
-                else
-                    checker:report_tcp_failure(ctx.balancer_ip, port or ctx.balancer_port, host)
-                end
+            local state, code
+            if prev_failure then
+                state, code = prev_failure.state, prev_failure.code
             else
-                checker:report_http_status(ctx.balancer_ip, port or ctx.balancer_port, host, code)
+                state, code = get_last_failure()
             end
+            report_failure(ctx, checker, up_conf, state, code)
         end
     end
 
-    if checker then
+    local health_status
+    if checker and up_conf.type == "chash" then
+        health_status = fetch_health_status(up_conf, checker, key, version)
+    end
+
+    if checker and up_conf.type ~= "chash" then
         version = version .. "#" .. checker.status_ver
+    end
+
+    if up_conf.warm_up_conf then
+        version = version .. (slow_start.version_suffix(up_conf) or "")
     end
 
     -- the same picker will be used in the whole request, especially during the retry
@@ -243,12 +346,34 @@ local function pick_server(route, ctx)
         return nil, "failed to fetch server picker"
     end
 
-    local server, err = server_picker.get(ctx)
+    local server, err
+    for _ = 1, nodes_count do
+        server, err = server_picker.get(ctx)
+        if not server then
+            err = err or "no valid upstream node"
+            return nil, "failed to find valid upstream server, " .. err
+        end
+
+        if not health_status or health_status[server] then
+            break
+        end
+
+        ctx.balancer_server = server
+        if not server_picker.after_balance then
+            return nil, "failed to skip unhealthy upstream server: after_balance is unavailable"
+        end
+
+        server_picker.after_balance(ctx, true)
+        server = nil
+    end
+
     if not server then
-        err = err or "no valid upstream node"
-        return nil, "failed to find valid upstream server, " .. err
+        return nil, "failed to find valid upstream server, all upstream servers tried"
     end
     ctx.balancer_server = server
+    -- from here on the request holds a server, so the log phase must be able to
+    -- release it even if we bail out below
+    ctx.server_picker = server_picker
 
     local domain = server_picker.addr_to_domain[server]
     local res, err = lrucache_addr(server, nil, parse_addr, server)
@@ -260,7 +385,11 @@ local function pick_server(route, ctx)
     res.domain = domain
     ctx.balancer_ip = res.host
     ctx.balancer_port = res.port
-    ctx.server_picker = server_picker
+    ctx.upstream_unresolved_host = res.domain or res.host
+    -- also expose it as an nginx var so it can be used in the access log (http only)
+    if is_http and ctx.var then
+        ctx.var.upstream_unresolved_host = ctx.upstream_unresolved_host
+    end
     res.upstream_host = parse_server_for_upstream_host(res, ctx.upstream_scheme)
 
     return res
@@ -269,6 +398,29 @@ end
 
 -- for test
 _M.pick_server = pick_server
+
+
+-- reports a final failure with no next node to pick_server() for
+function _M.report_failure(ctx, prev_failure)
+    local checker = ctx.up_checker
+    if not checker then
+        return
+    end
+
+    report_failure(ctx, checker, ctx.upstream_conf, prev_failure.state, prev_failure.code)
+end
+
+
+-- Keyed by the `ca_certs` array itself: a config update always rebuilds that
+-- table, so a stale digest can never outlive the certificates it was made from.
+local ca_certs_digest_cache = core.lrucache.new({
+    ttl = 300, count = 256,
+})
+
+
+local function ca_certs_digest(ca_certs)
+    return ngx_md5(core.table.concat(ca_certs, "\n"))
+end
 
 
 local set_current_peer
@@ -311,8 +463,25 @@ do
                 local sni = ctx.var.upstream_host
                 pool = pool .. "#" .. sni
 
-                if up_conf.tls and up_conf.tls.client_cert then
-                    pool = pool .. "#" .. up_conf.tls.client_cert
+                local tls = up_conf.tls
+                -- separate the pool by client cert so referenced SSL objects
+                -- don't share a connection
+                if tls and tls.client_cert then
+                    pool = pool .. "#" .. tls.client_cert
+                elseif tls and tls.client_cert_id then
+                    pool = pool .. "#" .. tls.client_cert_id
+                end
+
+                -- and by the verification policy, which is applied while the
+                -- connection is being established: a pooled connection keeps
+                -- whatever policy it was handshaked under, so reusing it across
+                -- policies would skip the verification the config asks for
+                if tls and (tls.verify ~= nil or tls.ca_certs) then
+                    pool = pool .. "#" .. tostring(tls.verify)
+                    if tls.ca_certs then
+                        pool = pool .. "#" .. ca_certs_digest_cache(tls.ca_certs, nil,
+                                                        ca_certs_digest, tls.ca_certs)
+                    end
                 end
             end
             pool_opt.pool = pool

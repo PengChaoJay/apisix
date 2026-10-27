@@ -15,6 +15,7 @@
 -- limitations under the License.
 --
 local core        = require("apisix.core")
+local secret      = require("apisix.secret")
 local expr        = require("resty.expr.v1")
 local re_compile  = require("resty.core.regex").re_match_compile
 local plugin_name = "response-rewrite"
@@ -37,6 +38,14 @@ local lrucache = core.lrucache.new({
 local schema = {
     type = "object",
     properties = {
+        max_resp_body_size = {
+            type = "integer",
+            minimum = 1,
+            default = 67108864,
+            description = "maximum response body size in bytes buffered into "
+                       .. "memory when filters are applied; larger responses "
+                       .. "are truncated",
+        },
         headers = {
             description = "new headers for response",
             anyOf = {
@@ -216,7 +225,7 @@ function _M.check_schema(conf)
         end
     end
 
-    if conf.body_base64 then
+    if conf.body_base64 and not secret.is_secret_ref(conf.body) then
         if not conf.body or #conf.body == 0 then
             return false, 'invalid base64 content'
         end
@@ -256,7 +265,7 @@ function _M.body_filter(conf, ctx)
 
     if conf.filters then
 
-        local body = core.response.hold_body_chunk(ctx)
+        local body = core.response.hold_body_chunk(ctx, false, conf.max_resp_body_size)
         if not body then
             return
         end

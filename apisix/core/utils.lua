@@ -24,6 +24,7 @@ local core_str       = require("apisix.core.string")
 local rfind_char     = core_str.rfind_char
 local table          = require("apisix.core.table")
 local log            = require("apisix.core.log")
+local json           = require("apisix.core.json")
 local string         = require("apisix.core.string")
 local dns_client     = require("apisix.core.dns.client")
 local ngx_re         = require("ngx.re")
@@ -47,6 +48,12 @@ local get_string_buf = base.get_string_buf
 local exiting        = ngx.worker.exiting
 local ngx_sleep      = ngx.sleep
 local ipairs         = ipairs
+local str_format     = string.format
+local ngx_now        = ngx.now
+local ngx_update_time = ngx.update_time
+local math_random    = math.random
+local math_floor     = math.floor
+local bit            = require("bit")
 
 local hostname
 local dns_resolvers
@@ -215,6 +222,17 @@ function _M.uri_safe_encode(uri)
     C.ngx_escape_uri(buf, uri, #uri, 0)
 
     return ffi_string(buf, len)
+end
+
+
+-- escape_uri_control_chars percent-encodes control characters (0x00-0x1F and 0x7F,
+-- which include CR and LF) while leaving every other byte untouched. It is used on
+-- parts of $upstream_uri that must keep their query delimiters (?, =, &) but must not
+-- be able to inject CR/LF into the upstream request line.
+function _M.escape_uri_control_chars(uri)
+    return (str_gsub(uri, "[%z\1-\31\127]", function(c)
+        return str_format("%%%02X", str_byte(c))
+    end))
 end
 
 
@@ -415,6 +433,9 @@ local function get_root_conf(str, conf, field)
     local num_of_matches = #matches
     for i = 1, num_of_matches - 1 , 1 do
         conf = conf[matches[i]]
+        if type(conf) ~= "table" then
+            return nil, nil
+        end
     end
 
     -- return the table and the last field
@@ -435,12 +456,12 @@ function _M.check_https(fields, conf, plugin_name)
 
         local new_conf, new_field = get_root_conf(field, conf)
         if not new_conf then
-            return
+            goto continue
         end
 
         local value = new_conf[new_field]
         if not value then
-            return
+            goto continue
         end
 
         if type(value) == "table" then
@@ -450,6 +471,8 @@ function _M.check_https(fields, conf, plugin_name)
         else
             find_and_log(field, plugin_name, value)
         end
+
+        ::continue::
     end
 end
 
@@ -469,6 +492,159 @@ function _M.check_tls_bool(fields, conf, plugin_name)
                      plugin_name, " configuration is a security risk")
         end
     end
+end
+
+
+local function to_ms(seconds)
+    if seconds == nil then
+        return json.null
+    end
+    return math_floor(seconds * 1000 + 0.5)
+end
+
+
+local function round(value, scale)
+    return math_floor(value * scale + 0.5) / scale
+end
+
+
+local function or_null(value)
+    if value == nil then
+        return json.null
+    end
+    return value
+end
+
+
+local function current_window_info(detail)
+    local window_size = detail.window_size
+    if detail.window_type ~= "sliding" then
+        local window_end = detail.window_end
+        return {
+            start_ms = to_ms(window_end and window_end - window_size),
+            end_ms = to_ms(window_end),
+            count = or_null(detail.count),
+            created = or_null(detail.created),
+        }
+    end
+
+    -- sliding windows are aligned to the clock: the window containing
+    -- `window_now` is the id-th one since the epoch, and the previous window's
+    -- count is weighted by the share of it still inside the sliding range
+    local window_now = detail.window_now
+    local last_count = detail.last_count
+    local id, window_start, weight
+    if window_now then
+        id = math_floor(window_now / window_size)
+        window_start = id * window_size
+        weight = (window_size - window_now % window_size) / window_size
+    end
+
+    return {
+        id = or_null(id),
+        start_ms = to_ms(window_start),
+        end_ms = to_ms(window_start and window_start + window_size),
+        count = or_null(detail.count),
+    }, {
+        count = or_null(last_count),
+        weight = weight and round(weight, 1e6) or json.null,
+        weighted_count = (weight and last_count) and round(last_count * weight, 1e3)
+                         or json.null,
+    }
+end
+
+
+-- `detail` (optional) describes the window the request was counted in, see
+-- the $rate_limiting_info section of the limit-count plugin docs
+function _M.set_var_rate_limiting_info(ctx, key, limit, remaining, reset, detail)
+    if not ctx then
+        return
+    end
+
+    local info = {
+        rate_limiting_key = tostring(key or ""),
+        rate_limiting_limit = math_floor(limit or 0),
+        rate_limiting_remaining = math_floor(tonumber(remaining) or 0),
+        rate_limiting_reset = math_floor(reset or 0),
+    }
+
+    if detail then
+        info.window_type = detail.window_type
+        info.window_size_ms = to_ms(detail.window_size)
+        info.decision = detail.decision
+        if detail.decision ~= "error" then
+            info.cost = detail.cost
+            info.evaluated_at_ms = to_ms(detail.now)
+            local delayed = detail.delayed_sync
+            if delayed then
+                info.delayed_sync = {
+                    synced_at_ms = to_ms(delayed.synced_at),
+                    synced_count = or_null(delayed.synced_count),
+                    local_delta = or_null(delayed.local_delta),
+                }
+            end
+            info.current_window, info.previous_window = current_window_info(detail)
+        end
+    end
+
+    ctx.var.rate_limiting_info = json.encode(info)
+end
+
+
+-- worker-local monotonic state for UUID v7 (no shared dict needed)
+-- Each nginx worker has its own copy; no locking required.
+local _v7_last_ms = 0
+local _v7_seq     = 0
+local _v7_rand_b  = { 0, 0, 0, 0, 0, 0, 0 }  -- 7 bytes = 56 random bits
+
+
+local function _v7_reset(ms)
+    _v7_last_ms = ms
+    _v7_seq = 0
+    for i = 1, 7 do
+        _v7_rand_b[i] = math_random(0, 255)
+    end
+end
+
+
+function _M.generate_uuid_v7()
+    local ms = math_floor(ngx_now() * 1000)
+
+    if ms > _v7_last_ms then
+        _v7_reset(ms)
+    else
+        if ms < _v7_last_ms then
+            ms = _v7_last_ms
+        end
+
+        _v7_seq = _v7_seq + 1
+        if _v7_seq > 0x3ffff then
+            repeat
+                ngx_update_time()
+                ms = math_floor(ngx_now() * 1000)
+            until ms > _v7_last_ms
+            _v7_reset(ms)
+        end
+    end
+
+    local ts_hi = math_floor(ms / 0x100000000)
+    local ts_lo = ms % 0x100000000
+
+    local seq_hi = bit.rshift(_v7_seq, 6)
+    local seq_lo = bit.band(_v7_seq, 0x3F)
+
+    local r = _v7_rand_b
+    return str_format(
+        "%02x%02x%04x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        bit.rshift(ts_hi, 8),
+        bit.band(ts_hi, 0xFF),
+        bit.rshift(ts_lo, 16),
+        bit.band(ts_lo, 0xFFFF),
+        bit.bor(0x7000, seq_hi),
+        bit.bor(0x80, seq_lo),
+        r[1],
+        r[2], r[3], r[4], r[5], r[6], r[7]
+    )
 end
 
 

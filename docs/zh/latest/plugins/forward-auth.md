@@ -6,8 +6,9 @@ keywords:
   - Plugin
   - Forward Authentication
   - forward-auth
-description: 本文介绍了关于 Apache APISIX `forward-auth` 插件的基本信息及使用方法。
+description: forward-auth 插件集成外部授权服务，增强 API 安全性和访问控制。
 ---
+
 <!--
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
@@ -27,45 +28,66 @@ description: 本文介绍了关于 Apache APISIX `forward-auth` 插件的基本�
 #
 -->
 
+<head>
+  <link rel="canonical" href="https://docs.api7.ai/hub/forward-auth" />
+</head>
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
 ## 描述
 
-`forward-auth` 插件使用的是经典外部认证。当身份认证失败时，可以实现自定义错误或者重定向到认证页面的场景。
+`forward-auth` 插件支持与外部授权服务集成，用于身份验证和授权。如果认证失败，将向客户端返回可自定义的错误消息。如果认证成功，请求将连同以下由 APISIX 添加的请求头一起转发到上游服务：
 
-`forward-auth` 插件巧妙地将身份认证和授权逻辑移到了一个专门的外部服务中，APISIX 将用户的请求转发给认证服务并阻塞原始请求，然后在认证服务下以非 2xx 状态响应时进行结果替换。
-
-## 属性
-
-| 名称              | 类型           | 必选项 |  默认值 | 有效值         | 描述                                                                                                               |
-| ----------------- | ------------- | ------| ------- | -------------- | -------------------------------------------------------------------------------------------------------------------- |
-| uri               | string        | 是    |         |                | 设置 `authorization` 服务的地址 (例如：https://localhost:9188)。                                                      |
-| ssl_verify        | boolean       | 否    | true    | [true, false]  | 当设置为 `true` 时，验证 SSL 证书。                                                                                  |
-| request_method    | string        | 否    | GET     | ["GET","POST"] | 客户端向 authorization 服务发送请求的方法。当设置为 POST 时，会将 request body 转发至 authorization 服务。         |
-| request_headers   | array[string] | 否    |         |                | 设置需要由客户端转发到 `authorization` 服务的请求头。如果没有设置，则只发送 APISIX 提供的 headers (例如：X-Forwarded-XXX)。 |
-| extra_headers   |object | False    |         |                | 以键值格式传递给授权服务的额外标头。值可以是变量，例如“$request_uri”或“$post_arg.xyz”。 |
-| upstream_headers  | array[string] | 否    |         |                | 认证通过时，设置 `authorization` 服务转发至 `upstream` 的请求头。如果不设置则不转发任何请求头。                             |
-| client_headers    | array[string] | 否    |         |                | 认证失败时，由 `authorization` 服务向 `client` 发送的响应头。如果不设置则不转发任何响应头。                                |
-| timeout           | integer       | 否    | 3000ms  | [1, 60000]ms   | `authorization` 服务请求超时时间。                                                                                     |
-| keepalive         | boolean       | 否    | true    | [true, false]  | HTTP 长连接。                                                                                                         |
-| keepalive_timeout | integer       | 否    | 60000ms | [1000, ...]ms  | 长连接超时时间。                                                                                                      |
-| keepalive_pool    | integer       | 否    | 5       | [1, ...]ms     | 长连接池大小。                                                                                                        |
-| allow_degradation | boolean       | 否    | false   |                | 当设置为 `true` 时，允许在身份验证服务器不可用时跳过身份验证。 |
-| status_on_error   | integer       | 否    | 403     | [200,...,599]   | 设置授权服务出现网络错误时返回给客户端的 HTTP 状态。默认状态为“403”。 |
-
-## 数据定义
-
-APISIX 将生成并发送如下所示的请求头到认证服务：
-
-| Scheme            | HTTP Method        | Host              | URI             | Source IP       |
-| ----------------- | ------------------ | ----------------- | --------------- | --------------- |
-| X-Forwarded-Proto | X-Forwarded-Method | X-Forwarded-Host  | X-Forwarded-Uri | X-Forwarded-For |
-
-## 使用示例
-
-首先，你需要设置一个外部认证服务。以下示例使用的是 Apache APISIX 无服务器插件模拟服务：
+- `X-Forwarded-Proto`：协议
+- `X-Forwarded-Method`：HTTP 方法
+- `X-Forwarded-Host`：主机
+- `X-Forwarded-Uri`：规范化后的 URI，包含查询字符串
+- `X-Forwarded-For`：源 IP
 
 :::note
 
-您可以这样从 `config.yaml` 中获取 `admin_key` 并存入环境变量：
+这些请求头描述的是客户端发送的原始请求。如果该路由同时使用 [proxy-rewrite](./proxy-rewrite.md) 改写请求，上游服务收到的是改写后的协议、方法、主机和 URI，而上述请求头仍然携带客户端的值。
+
+如果授权服务需要根据上游服务实际收到的 URI 做出决策，请通过 `extra_headers` 和 `$upstream_uri` 变量显式传递：
+
+```json
+{
+  "extra_headers": {
+    "X-Forwarded-Upstream-Uri": "$upstream_uri"
+  }
+}
+```
+
+`$upstream_uri` 由改写转发路径的插件设置，例如 `proxy-rewrite`。当没有插件改写请求时该变量为空，此时上游服务收到的就是 `X-Forwarded-Uri` 中的 URI。
+
+:::
+
+## 属性
+
+| 名称              | 类型    | 必选项 | 默认值  | 有效值                        | 描述                                                                                                                                                                                                                                                       |
+| ----------------- | ------- | ------ | ------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| uri               | string  | 是     |         |                               | 外部授权服务的 URI。                                                                                                                                                                                                                                        |
+| ssl_verify        | boolean | 否     | true    |                               | 如果为 true，则验证授权服务的 SSL 证书。                                                                                                                                                                                                                   |
+| request_method    | string  | 否     | GET     | `GET` 或 `POST`               | APISIX 向外部授权服务发送请求时使用的 HTTP 方法。当设置为 `POST` 时，APISIX 将连同请求体一起向外部授权服务发送 POST 请求。如果授权决策依赖 POST 正文中的请求参数，建议使用 `$post_arg.*` 提取必要字段并通过 `extra_headers` 字段传递，而不是发送完整请求体。 |
+| request_headers   | array   | 否     |         |                               | 需要转发给外部授权服务的客户端请求头。如果未配置，则只转发 APISIX 添加的请求头，例如 `X-Forwarded-*`。                                                                                                                                                     |
+| upstream_headers  | array   | 否     |         |                               | 认证通过时，需要转发到 Upstream 服务的外部授权服务响应头。如果未配置，则不转发任何请求头。                                                                                                                                                                 |
+| client_headers    | array   | 否     |         |                               | 认证失败时，需要转发给客户端的外部授权服务响应头。如果未配置，则不转发任何响应头。                                                                                                                                                                         |
+| extra_headers     | object  | 否     |         |                               | 发送给授权服务的额外请求头，支持在值中使用 [NGINX 变量](https://nginx.org/en/docs/http/ngx_http_core_module.html)。                                                                                                                                         |
+| timeout           | integer | 否     | 3000    | 1 到 60000 之间（含）         | 外部授权服务 HTTP 调用的超时时间（毫秒）。                                                                                                                                                                                                                 |
+| keepalive         | boolean | 否     | true    |                               | 如果为 true，则保持连接以处理多个请求。                                                                                                                                                                                                                    |
+| keepalive_timeout | integer | 否     | 60000   | >= 1000                       | 已建立的 HTTP 连接在关闭前的空闲时间（毫秒）。                                                                                                                                                                                                             |
+| keepalive_pool    | integer | 否     | 5       | >= 1                          | 连接池中的最大连接数。                                                                                                                                                                                                                                     |
+| allow_degradation | boolean | 否     | false   |                               | 如果为 true，则允许在插件或其依赖项不可用时，APISIX 继续处理请求而不使用该插件。                                                                                                                                                                           |
+| status_on_error   | integer | 否     | 403     | 200 到 599 之间（含）         | 与外部授权服务出现网络错误时返回给客户端的 HTTP 状态码。                                                                                                                                                                                                   |
+
+## 使用示例
+
+以下示例演示了如何针对不同场景使用 `forward-auth`。
+
+:::note
+
+你可以这样从 `config.yaml` 中获取 `admin_key` 并存入环境变量：
 
 ```bash
 admin_key=$(yq '.deployment.admin.admin_key[0].key' conf/config.yaml | sed 's/"//g')
@@ -73,223 +95,1037 @@ admin_key=$(yq '.deployment.admin.admin_key[0].key' conf/config.yaml | sed 's/"/
 
 :::
 
+要跟随前两个示例操作，请提前搭建好外部授权服务，或使用 [serverless-pre-function](./serverless.md) 插件创建如下所示的模拟认证服务：
+
+<Tabs groupId="api">
+<TabItem value="admin-api" label="Admin API">
+
 ```shell
-curl -X PUT 'http://127.0.0.1:9180/apisix/admin/routes/auth' \
-    -H "X-API-KEY: $admin_key" \
-    -H 'Content-Type: application/json' \
-    -d '{
+curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
+  -H "X-API-KEY: ${admin_key}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "id": "auth-mock",
     "uri": "/auth",
     "plugins": {
-        "serverless-pre-function": {
-            "phase": "rewrite",
-            "functions": [
-                "return function (conf, ctx)
-                    local core = require(\"apisix.core\");
-                    local authorization = core.request.header(ctx, \"Authorization\");
-                    if authorization == \"123\" then
-                        core.response.exit(200);
-                    elseif authorization == \"321\" then
-                        core.response.set_header(\"X-User-ID\", \"i-am-user\");
-                        core.response.exit(200);
-                    else core.response.set_header(\"Location\", \"http://example.com/auth\");
-                        core.response.exit(403);
-                    end
-                end"
-            ]
-        }
+      "serverless-pre-function": {
+        "phase": "rewrite",
+        "functions": [
+          "return function (conf, ctx)
+            local core = require(\"apisix.core\");
+            local authorization = core.request.header(ctx, \"Authorization\");
+            if authorization == \"123\" then
+              core.response.exit(200);
+            elseif authorization == \"321\" then
+              core.response.set_header(\"X-User-ID\", \"i-am-user\");
+              core.response.exit(200);
+            else core.response.set_header(\"X-Forward-Auth\", \"Fail\");
+              core.response.exit(403);
+            end
+          end"
+        ]
+      }
     }
-}'
+  }'
 ```
 
-现在你可以在指定 Route 上启用 `forward-auth` 插件：
+</TabItem>
+
+<TabItem value="adc" label="ADC">
+
+```yaml title="adc-auth-mock.yaml"
+services:
+  - name: auth-mock-service
+    routes:
+      - name: auth-mock-route
+        uris:
+          - /auth
+        plugins:
+          serverless-pre-function:
+            phase: rewrite
+            functions:
+              - |
+                return function(conf, ctx)
+                  local core = require("apisix.core")
+                  local authorization = core.request.header(ctx, "Authorization")
+                  if authorization == "123" then
+                    core.response.exit(200)
+                  elseif authorization == "321" then
+                    core.response.set_header("X-User-ID", "i-am-user")
+                    core.response.exit(200)
+                  else
+                    core.response.set_header("X-Forward-Auth", "Fail")
+                    core.response.exit(403)
+                  end
+                end
+    upstream:
+      type: roundrobin
+      nodes:
+        - host: httpbin.org
+          port: 80
+          weight: 1
+```
+
+将配置同步到网关：
 
 ```shell
-curl -X PUT 'http://127.0.0.1:9180/apisix/admin/routes/1' \
-    -H "X-API-KEY: $admin_key" \
-    -d '{
+adc sync -f adc-auth-mock.yaml
+```
+
+</TabItem>
+
+<TabItem value="ingress" label="Ingress Controller">
+
+<Tabs groupId="k8s-api">
+<TabItem value="gateway-api" label="Gateway API">
+
+```yaml title="forward-auth-mock-ic.yaml"
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: aic
+  name: httpbin-external-domain
+spec:
+  type: ExternalName
+  externalName: httpbin.org
+---
+apiVersion: apisix.apache.org/v1alpha1
+kind: PluginConfig
+metadata:
+  namespace: aic
+  name: auth-mock-plugin-config
+spec:
+  plugins:
+    - name: serverless-pre-function
+      config:
+        phase: rewrite
+        functions:
+          - |
+            return function(conf, ctx)
+              local core = require("apisix.core")
+              local authorization = core.request.header(ctx, "Authorization")
+              if authorization == "123" then
+                core.response.exit(200)
+              elseif authorization == "321" then
+                core.response.set_header("X-User-ID", "i-am-user")
+                core.response.exit(200)
+              else
+                core.response.set_header("X-Forward-Auth", "Fail")
+                core.response.exit(403)
+              end
+            end
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  namespace: aic
+  name: auth-mock-route
+spec:
+  parentRefs:
+    - name: apisix
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /auth
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: apisix.apache.org
+            kind: PluginConfig
+            name: auth-mock-plugin-config
+      backendRefs:
+        - name: httpbin-external-domain
+          port: 80
+```
+
+将配置应用到集群：
+
+```shell
+kubectl apply -f forward-auth-mock-ic.yaml
+```
+
+</TabItem>
+
+<TabItem value="ingress" label="APISIX Ingress Controller">
+
+```yaml title="forward-auth-mock-ic.yaml"
+apiVersion: apisix.apache.org/v2
+kind: ApisixUpstream
+metadata:
+  namespace: aic
+  name: httpbin-external-domain
+spec:
+  ingressClassName: apisix
+  externalNodes:
+  - type: Domain
+    name: httpbin.org
+---
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  namespace: aic
+  name: auth-mock-route
+spec:
+  ingressClassName: apisix
+  http:
+    - name: auth-mock-route
+      match:
+        paths:
+          - /auth
+      upstreams:
+      - name: httpbin-external-domain
+      plugins:
+      - name: serverless-pre-function
+        enable: true
+        config:
+          phase: rewrite
+          functions:
+            - |
+              return function(conf, ctx)
+                local core = require("apisix.core")
+                local authorization = core.request.header(ctx, "Authorization")
+                if authorization == "123" then
+                  core.response.exit(200)
+                elseif authorization == "321" then
+                  core.response.set_header("X-User-ID", "i-am-user")
+                  core.response.exit(200)
+                else
+                  core.response.set_header("X-Forward-Auth", "Fail")
+                  core.response.exit(403)
+                end
+              end
+```
+
+将配置应用到集群：
+
+```shell
+kubectl apply -f forward-auth-mock-ic.yaml
+```
+
+</TabItem>
+</Tabs>
+
+</TabItem>
+</Tabs>
+
+### 将指定请求头转发至上游资源
+
+以下示例演示了如何在路由上配置 `forward-auth`，根据请求头中的值控制客户端对上游资源的访问，并将授权服务设置的特定请求头转发至上游资源。
+
+按如下方式创建带有 `forward-auth` 插件的路由：
+
+<Tabs groupId="api">
+<TabItem value="admin-api" label="Admin API">
+
+```shell
+curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
+  -H "X-API-KEY: ${admin_key}" \
+  -d '{
+    "id": "forward-auth-route",
     "uri": "/headers",
     "plugins": {
-        "forward-auth": {
-            "uri": "http://127.0.0.1:9080/auth",
-            "request_headers": ["Authorization"],
-            "upstream_headers": ["X-User-ID"],
-            "client_headers": ["Location"]
-        }
+      "forward-auth": {
+        "uri": "http://127.0.0.1:9080/auth",
+        "request_headers": ["Authorization"],
+        "upstream_headers": ["X-User-ID"]
+      }
     },
     "upstream": {
-        "nodes": {
-            "httpbin.org:80": 1
-        },
-        "type": "roundrobin"
+      "nodes": {
+        "httpbin.org:80": 1
+      },
+      "type": "roundrobin"
     }
-}'
+  }'
 ```
 
-完成上述配置后，可通过以下三种方式进行测试：
+</TabItem>
 
-- 在请求头中发送认证的详细信息：
+<TabItem value="adc" label="ADC">
+
+```yaml title="adc.yaml"
+services:
+  - name: forward-auth-service
+    routes:
+      - name: forward-auth-route
+        uris:
+          - /headers
+        plugins:
+          forward-auth:
+            uri: http://127.0.0.1:9080/auth
+            request_headers:
+              - Authorization
+            upstream_headers:
+              - X-User-ID
+    upstream:
+      type: roundrobin
+      nodes:
+        - host: httpbin.org
+          port: 80
+          weight: 1
+```
+
+将配置同步到网关：
 
 ```shell
-curl http://127.0.0.1:9080/headers -H 'Authorization: 123'
+adc sync -f adc.yaml
 ```
 
-```
-{
-    "headers": {
-        "Authorization": "123",
-        "Next": "More-headers"
-    }
-}
+</TabItem>
+
+<TabItem value="ingress-controller" label="Ingress Controller">
+
+<Tabs groupId="k8s-api">
+<TabItem value="gateway-api" label="Gateway API">
+
+```yaml title="forward-auth-ic.yaml"
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: aic
+  name: httpbin-external-domain
+spec:
+  type: ExternalName
+  externalName: httpbin.org
+---
+apiVersion: apisix.apache.org/v1alpha1
+kind: PluginConfig
+metadata:
+  namespace: aic
+  name: forward-auth-plugin-config
+spec:
+  plugins:
+    - name: forward-auth
+      config:
+        uri: http://apisix-gateway.aic.svc.cluster.local/auth
+        request_headers:
+          - Authorization
+        upstream_headers:
+          - X-User-ID
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  namespace: aic
+  name: forward-auth-route
+spec:
+  parentRefs:
+    - name: apisix
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /headers
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: apisix.apache.org
+            kind: PluginConfig
+            name: forward-auth-plugin-config
+      backendRefs:
+        - name: httpbin-external-domain
+          port: 80
 ```
 
-- 转发认证服务响应头到 Upstream。
+将配置应用到集群：
 
 ```shell
-curl http://127.0.0.1:9080/headers -H 'Authorization: 321'
+kubectl apply -f forward-auth-ic.yaml
 ```
 
-```
-{
-    "headers": {
-        "Authorization": "321",
-        "X-User-ID": "i-am-user",
-        "Next": "More-headers"
-    }
-}
+</TabItem>
+
+<TabItem value="apisix-ingress-controller" label="APISIX Ingress Controller">
+
+```yaml title="forward-auth-ic.yaml"
+apiVersion: apisix.apache.org/v2
+kind: ApisixUpstream
+metadata:
+  namespace: aic
+  name: httpbin-external-domain
+spec:
+  ingressClassName: apisix
+  externalNodes:
+  - type: Domain
+    name: httpbin.org
+---
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  namespace: aic
+  name: forward-auth-route
+spec:
+  ingressClassName: apisix
+  http:
+    - name: forward-auth-route
+      match:
+        paths:
+          - /headers
+      upstreams:
+      - name: httpbin-external-domain
+      plugins:
+      - name: forward-auth
+        enable: true
+        config:
+          uri: http://apisix-gateway.aic.svc.cluster.local/auth
+          request_headers:
+            - Authorization
+          upstream_headers:
+            - X-User-ID
 ```
 
-- 当授权失败时，认证服务可以向用户发送自定义响应：
+将配置应用到集群：
 
 ```shell
-curl -i http://127.0.0.1:9080/headers
+kubectl apply -f forward-auth-ic.yaml
 ```
+
+</TabItem>
+</Tabs>
+
+</TabItem>
+</Tabs>
+
+向路由发送包含认证信息的请求：
 
 ```shell
-HTTP/1.1 403 Forbidden
-Location: http://example.com/auth
+curl "http://127.0.0.1:9080/headers" -H 'Authorization: 123'
 ```
 
-### Using data from POST body to make decision on Authorization service
-
-::: note
-当要根据 POST 正文做出决定时，建议使用带有 `extra_headers` 字段的 `$post_arg.*` 并根据标头对授权服务做出决定，而不是使用 POST `request_method` 将整个请求正文传递给授权服务。
-:::
-
-在 `/auth` 路由上创建一个无服务器函数，用于检查 `tenant_id` 标头是否存在。如果存在，路由会使用 HTTP 200 进行响应，并将 `X-User-ID` 标头设置为固定值 `i-am-an-user`。如果缺少 `tenant_id`，则会返回 HTTP 400 和错误消息。
-
-```shell
-curl -X PUT 'http://127.0.0.1:9180/apisix/admin/routes/auth' \
-    -H "X-API-KEY: $admin_key" \
-    -H 'Content-Type: application/json' \
-    -d '{
-    "uri": "/auth",
-    "plugins": {
-        "serverless-pre-function": {
-            "phase": "rewrite",
-            "functions": [
-                "return function(conf, ctx)
-                 local core = require(\"apisix.core\")
-                 local tenant_id = core.request.header(ctx, \"tenant_id\")
-                 if tenant_id == \"123\" then
-                     core.response.set_header(\"X-User-ID\", \"i-am-an-user\");
-                     core.response.exit(200);
-                else
-                    core.response.exit(400, \"tenant_id is \"..tenant_id .. \" but expected 123\");
-                end
-            end"
-            ]
-        }
-    }
-}'
-```
-
-创建一个接受 POST 请求的路由，并使用 `forward-auth` 插件通过请求中的 `tenant_id` 调用身份验证端点。仅当身份验证检查返回 200 时，请求才会转发到上游服务。
-
-```shell
-curl -X PUT 'http://127.0.0.1:9180/apisix/admin/routes/1' \
-    -H "X-API-KEY: $admin_key" \
-    -d '{
-    "uri": "/post",
-    "methods": ["POST"],
-    "plugins": {
-        "forward-auth": {
-            "uri": "http://127.0.0.1:9080/auth",
-            "request_method": "GET",
-            "extra_headers": {"tenant_id": "$post_arg.tenant_id"}
-        }
-    },
-    "upstream": {
-        "nodes": {
-            "httpbin.org:80": 1
-        },
-        "type": "roundrobin"
-    }
-}'
-```
-
-发送带有 `tenant_id` 标头的 POST 请求：
-
-```shell
-curl -i http://127.0.0.1:9080/post -H "Content-Type: application/json" -X POST -d '{
-   "tenant_id": "123"
-}'
-```
-
-您应该收到类似以下内容的 `HTTP/1.1 200 OK` 响应：
+你应该看到 `HTTP/1.1 200 OK` 响应如下：
 
 ```json
 {
-  "args": {},
-  "data": "{\n   \"tenant_id\": \"123\"\n}",
-  "files": {},
-  "form": {},
   "headers": {
     "Accept": "*/*",
-    "Content-Length": "25",
-    "Content-Type": "application/json",
-    "Host": "127.0.0.1",
-    "User-Agent": "curl/8.13.0",
-    "X-Amzn-Trace-Id": "Root=1-687775d8-6890073173b30c2834901e8b",
-    "X-Forwarded-Host": "127.0.0.1"
-  },
-  "json": {
-    "tenant_id": "123"
-  },
-  "origin": "127.0.0.1, 106.215.82.114",
-  "url": "http://127.0.0.1/post"
+    "Authorization": "123",
+    ...
+  }
 }
 ```
 
-发送带有错误 `tenant_id` 标头的 POST 请求：
+要验证授权服务设置的 `X-User-ID` 请求头是否会转发给上游服务，请使用对应的认证信息向路由发送请求：
 
 ```shell
-curl -i http://127.0.0.1:9080/post -H "Content-Type: application/json" -X POST -d '{
-   "tenant_id": "asdfasd"
-}'
+curl "http://127.0.0.1:9080/headers" -H 'Authorization: 321'
 ```
 
-您应该收到包含以下消息的 `HTTP/1.1 400 Bad Request` 响应：
+你应该看到 `HTTP/1.1 200 OK` 响应如下，显示请求头已被转发至上游：
 
-```shell
-tenant_id is asdfasd but expected 123
-```
-
-## 删除插件
-
-当你需要禁用 `forward-auth` 插件时，可以通过以下命令删除相应的 JSON 配置，APISIX 将会自动重新加载相关配置，无需重启服务：
-
-```shell
-curl http://127.0.0.1:9180/apisix/admin/routes/1 \
--H "X-API-KEY: $admin_key" -X PUT -d '
+```json
 {
-    "methods": ["GET"],
-    "uri": "/hello",
-    "plugins": {},
+  "headers": {
+    "Accept": "*/*",
+    "Authorization": "123",
+    "X-User-ID": "i-am-user",
+    ...
+  }
+}
+```
+
+### 认证失败时向客户端返回指定请求头
+
+以下示例演示了如何在路由上配置 `forward-auth`，控制客户端对上游资源的访问，并在认证失败时将授权服务返回的特定请求头传递给客户端。
+
+按如下方式创建带有 `forward-auth` 插件的路由：
+
+<Tabs groupId="api">
+<TabItem value="admin-api" label="Admin API">
+
+```shell
+curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
+  -H "X-API-KEY: ${admin_key}" \
+  -d '{
+    "id": "forward-auth-route",
+    "uri": "/headers",
+    "plugins": {
+      "forward-auth": {
+        "uri": "http://127.0.0.1:9080/auth",
+        "request_headers": ["Authorization"],
+        "client_headers": ["X-Forward-Auth"]
+      }
+    },
     "upstream": {
-        "type": "roundrobin",
-        "nodes": {
-            "httpbin.org:80": 1
-        }
+      "nodes": {
+        "httpbin.org:80": 1
+      },
+      "type": "roundrobin"
     }
-}'
+  }'
+```
+
+</TabItem>
+
+<TabItem value="adc" label="ADC">
+
+```yaml title="adc.yaml"
+services:
+  - name: forward-auth-service
+    routes:
+      - name: forward-auth-route
+        uris:
+          - /headers
+        plugins:
+          forward-auth:
+            uri: http://127.0.0.1:9080/auth
+            request_headers:
+              - Authorization
+            client_headers:
+              - X-Forward-Auth
+    upstream:
+      type: roundrobin
+      nodes:
+        - host: httpbin.org
+          port: 80
+          weight: 1
+```
+
+将配置同步到网关：
+
+```shell
+adc sync -f adc.yaml
+```
+
+</TabItem>
+
+<TabItem value="ingress-controller" label="Ingress Controller">
+
+<Tabs groupId="k8s-api">
+<TabItem value="gateway-api" label="Gateway API">
+
+```yaml title="forward-auth-ic.yaml"
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: aic
+  name: httpbin-external-domain
+spec:
+  type: ExternalName
+  externalName: httpbin.org
+---
+apiVersion: apisix.apache.org/v1alpha1
+kind: PluginConfig
+metadata:
+  namespace: aic
+  name: forward-auth-plugin-config
+spec:
+  plugins:
+    - name: forward-auth
+      config:
+        uri: http://apisix-gateway.aic.svc.cluster.local/auth
+        request_headers:
+          - Authorization
+        client_headers:
+          - X-Forward-Auth
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  namespace: aic
+  name: forward-auth-route
+spec:
+  parentRefs:
+    - name: apisix
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /headers
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: apisix.apache.org
+            kind: PluginConfig
+            name: forward-auth-plugin-config
+      backendRefs:
+        - name: httpbin-external-domain
+          port: 80
+```
+
+将配置应用到集群：
+
+```shell
+kubectl apply -f forward-auth-ic.yaml
+```
+
+</TabItem>
+
+<TabItem value="apisix-ingress-controller" label="APISIX Ingress Controller">
+
+```yaml title="forward-auth-ic.yaml"
+apiVersion: apisix.apache.org/v2
+kind: ApisixUpstream
+metadata:
+  namespace: aic
+  name: httpbin-external-domain
+spec:
+  ingressClassName: apisix
+  externalNodes:
+  - type: Domain
+    name: httpbin.org
+---
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  namespace: aic
+  name: forward-auth-route
+spec:
+  ingressClassName: apisix
+  http:
+    - name: forward-auth-route
+      match:
+        paths:
+          - /headers
+      upstreams:
+      - name: httpbin-external-domain
+      plugins:
+      - name: forward-auth
+        enable: true
+        config:
+          uri: http://apisix-gateway.aic.svc.cluster.local/auth
+          request_headers:
+            - Authorization
+          client_headers:
+            - X-Forward-Auth
+```
+
+将配置应用到集群：
+
+```shell
+kubectl apply -f forward-auth-ic.yaml
+```
+
+</TabItem>
+</Tabs>
+
+</TabItem>
+</Tabs>
+
+不携带任何认证信息发送请求：
+
+```shell
+curl -i "http://127.0.0.1:9080/headers"
+```
+
+你应该收到 `HTTP/1.1 403 Forbidden` 响应：
+
+```text
+...
+X-Forward-Auth: Fail
+Server: APISIX/3.x.x
+
+<html>
+<head><title>403 Forbidden</title></head>
+<body>
+<center><h1>403 Forbidden</h1></center>
+<hr><center>openresty</center>
+<p><em>Powered by <a href="https://apisix.apache.org/">APISIX</a>.</em></p></body>
+</html>
+```
+
+### 基于 POST 请求体进行授权
+
+本示例演示如何配置 `forward-auth` 插件，根据 POST 请求体数据控制访问，将值以请求头的形式传递给授权服务，并在授权失败时拒绝请求。
+
+请提前搭建好外部授权服务，或使用 [serverless-pre-function](./serverless.md) 插件创建模拟认证服务。该函数检查 `tenant_id` 请求头是否为 `123`，如果是则返回 `200 OK`，否则返回 403 和错误消息。
+
+<Tabs groupId="api">
+<TabItem value="admin-api" label="Admin API">
+
+```shell
+curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
+  -H "X-API-KEY: ${admin_key}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "id": "auth-mock",
+    "uri": "/auth",
+    "plugins": {
+      "serverless-pre-function": {
+        "phase": "rewrite",
+        "functions": [
+          "return function(conf, ctx)
+            local core = require(\"apisix.core\")
+            local tenant_id = core.request.header(ctx, \"tenant_id\")
+            if tenant_id == \"123\" then
+              core.response.exit(200);
+          else
+            core.response.exit(403, \"tenant_id is \"..tenant_id .. \" but expecting 123\");
+          end
+        end"
+        ]
+      }
+    }
+  }'
+```
+
+</TabItem>
+
+<TabItem value="adc" label="ADC">
+
+```yaml title="adc-auth-mock.yaml"
+services:
+  - name: auth-mock-service
+    routes:
+      - name: auth-mock-route
+        uris:
+          - /auth
+        plugins:
+          serverless-pre-function:
+            phase: rewrite
+            functions:
+              - |
+                return function(conf, ctx)
+                  local core = require("apisix.core")
+                  local tenant_id = core.request.header(ctx, "tenant_id")
+                  if tenant_id == "123" then
+                    core.response.exit(200)
+                  else
+                    local tid = tenant_id or "<missing>"
+                    core.response.exit(403, "tenant_id is " .. tenant_id .. " but expecting 123")
+                  end
+                end
+    upstream:
+      type: roundrobin
+      nodes:
+        - host: httpbin.org
+          port: 80
+          weight: 1
+```
+
+将配置同步到网关：
+
+```shell
+adc sync -f adc-auth-mock.yaml
+```
+
+</TabItem>
+
+<TabItem value="ingress-controller" label="Ingress Controller">
+
+<Tabs groupId="k8s-api">
+<TabItem value="gateway-api" label="Gateway API">
+
+```yaml title="forward-auth-post-mock-ic.yaml"
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: aic
+  name: httpbin-external-domain
+spec:
+  type: ExternalName
+  externalName: httpbin.org
+---
+apiVersion: apisix.apache.org/v1alpha1
+kind: PluginConfig
+metadata:
+  namespace: aic
+  name: auth-mock-plugin-config
+spec:
+  plugins:
+    - name: serverless-pre-function
+      config:
+        phase: rewrite
+        functions:
+          - |
+            return function(conf, ctx)
+              local core = require("apisix.core")
+              local tenant_id = core.request.header(ctx, "tenant_id")
+              if tenant_id == "123" then
+                core.response.exit(200)
+              else
+                local tid = tenant_id or "<missing>"
+                core.response.exit(403, "tenant_id is " .. tostring(tenant_id) .. " but expecting 123")
+              end
+            end
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  namespace: aic
+  name: auth-mock-route
+spec:
+  parentRefs:
+    - name: apisix
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /auth
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: apisix.apache.org
+            kind: PluginConfig
+            name: auth-mock-plugin-config
+      backendRefs:
+        - name: httpbin-external-domain
+          port: 80
+```
+
+将配置应用到集群：
+
+```shell
+kubectl apply -f forward-auth-post-mock-ic.yaml
+```
+
+</TabItem>
+
+<TabItem value="apisix-ingress-controller" label="APISIX Ingress Controller">
+
+```yaml title="forward-auth-post-mock-ic.yaml"
+apiVersion: apisix.apache.org/v2
+kind: ApisixUpstream
+metadata:
+  namespace: aic
+  name: httpbin-external-domain
+spec:
+  ingressClassName: apisix
+  externalNodes:
+  - type: Domain
+    name: httpbin.org
+---
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  namespace: aic
+  name: auth-mock-route
+spec:
+  ingressClassName: apisix
+  http:
+    - name: auth-mock-route
+      match:
+        paths:
+          - /auth
+      upstreams:
+      - name: httpbin-external-domain
+      plugins:
+      - name: serverless-pre-function
+        enable: true
+        config:
+          phase: rewrite
+          functions:
+            - |
+              return function(conf, ctx)
+                local core = require("apisix.core")
+                local tenant_id = core.request.header(ctx, "tenant_id")
+                if tenant_id == "123" then
+                  core.response.exit(200)
+                else
+                  core.response.exit(403, "tenant_id is " .. tostring(tenant_id) .. " but expecting 123")
+                end
+              end
+```
+
+将配置应用到集群：
+
+```shell
+kubectl apply -f forward-auth-post-mock-ic.yaml
+```
+
+</TabItem>
+</Tabs>
+
+</TabItem>
+</Tabs>
+
+按如下方式创建带有 `forward-auth` 插件的路由：
+
+<Tabs groupId="api">
+<TabItem value="admin-api" label="Admin API">
+
+```shell
+curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
+  -H "X-API-KEY: ${admin_key}" \
+  -d '{
+    "id": "forward-auth-route",
+    "uri": "/post",
+    "methods": ["POST"],
+    "plugins": {
+      "forward-auth": {
+        "uri": "http://127.0.0.1:9080/auth",
+        "request_method": "GET",
+        "extra_headers": {"tenant_id": "$post_arg.tenant_id"}
+      }
+    },
+    "upstream": {
+      "nodes": {
+        "httpbin.org:80": 1
+      },
+      "type": "roundrobin"
+    }
+  }'
+```
+
+</TabItem>
+
+<TabItem value="adc" label="ADC">
+
+```yaml title="adc.yaml"
+services:
+  - name: forward-auth-service
+    routes:
+      - name: forward-auth-route
+        uris:
+          - /post
+        methods:
+          - POST
+        plugins:
+          forward-auth:
+            uri: http://127.0.0.1:9080/auth
+            request_method: GET
+            extra_headers:
+              tenant_id: "$post_arg.tenant_id"
+    upstream:
+      type: roundrobin
+      nodes:
+        - host: httpbin.org
+          port: 80
+          weight: 1
+```
+
+将配置同步到网关：
+
+```shell
+adc sync -f adc.yaml
+```
+
+</TabItem>
+
+<TabItem value="ingress-controller" label="Ingress Controller">
+
+<Tabs groupId="k8s-api">
+<TabItem value="gateway-api" label="Gateway API">
+
+```yaml title="forward-auth-post-ic.yaml"
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: aic
+  name: httpbin-external-domain
+spec:
+  type: ExternalName
+  externalName: httpbin.org
+---
+apiVersion: apisix.apache.org/v1alpha1
+kind: PluginConfig
+metadata:
+  namespace: aic
+  name: forward-auth-post-plugin-config
+spec:
+  plugins:
+    - name: forward-auth
+      config:
+        uri: http://apisix-gateway.aic.svc.cluster.local/auth
+        request_method: GET
+        extra_headers:
+          tenant_id: "$post_arg.tenant_id"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  namespace: aic
+  name: forward-auth-route
+spec:
+  parentRefs:
+    - name: apisix
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /post
+          method: POST
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: apisix.apache.org
+            kind: PluginConfig
+            name: forward-auth-post-plugin-config
+      backendRefs:
+        - name: httpbin-external-domain
+          port: 80
+```
+
+将配置应用到集群：
+
+```shell
+kubectl apply -f forward-auth-post-ic.yaml
+```
+
+</TabItem>
+
+<TabItem value="apisix-ingress-controller" label="APISIX Ingress Controller">
+
+```yaml title="forward-auth-post-ic.yaml"
+apiVersion: apisix.apache.org/v2
+kind: ApisixUpstream
+metadata:
+  namespace: aic
+  name: httpbin-external-domain
+spec:
+  ingressClassName: apisix
+  externalNodes:
+  - type: Domain
+    name: httpbin.org
+---
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  namespace: aic
+  name: forward-auth-route
+spec:
+  ingressClassName: apisix
+  http:
+    - name: forward-auth-route
+      match:
+        paths:
+          - /post
+        methods:
+          - POST
+      upstreams:
+      - name: httpbin-external-domain
+      plugins:
+      - name: forward-auth
+        enable: true
+        config:
+          uri: http://apisix-gateway.aic.svc.cluster.local/auth
+          request_method: GET
+          extra_headers:
+            tenant_id: "$post_arg.tenant_id"
+```
+
+将配置应用到集群：
+
+```shell
+kubectl apply -f forward-auth-post-ic.yaml
+```
+
+</TabItem>
+</Tabs>
+
+</TabItem>
+</Tabs>
+
+在请求体中携带 `tenant_id` 发送 POST 请求：
+
+```shell
+curl -i "http://127.0.0.1:9080/post" -X POST \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d 'tenant_id=123'
+```
+
+你应该收到 `HTTP/1.1 200 OK` 响应。
+
+在请求体中携带不同的 `tenant_id` 发送 POST 请求：
+
+```shell
+curl -i "http://127.0.0.1:9080/post" -X POST \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d 'tenant_id=000'
+```
+
+你应该收到 `HTTP/1.1 403 Forbidden` 响应，内容如下：
+
+```text
+tenant_id is 000 but expecting 123
 ```

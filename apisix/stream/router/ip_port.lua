@@ -19,6 +19,7 @@ local core_ip  = require("apisix.core.ip")
 local config_util = require("apisix.core.config_util")
 local stream_plugin_checker = require("apisix.plugin").stream_plugin_checker
 local router_new = require("apisix.utils.router").new
+local service_mod = require("apisix.http.service")
 local apisix_ssl = require("apisix.ssl")
 local xrpc = require("apisix.stream.xrpc")
 local error     = error
@@ -27,6 +28,7 @@ local ipairs = ipairs
 
 local user_routes
 local router_ver
+local service_ver
 local tls_router
 local other_routes = {}
 local _M = {version = 0.1}
@@ -56,6 +58,26 @@ local function match_addrs(route, vars)
     end
 
     return true
+end
+
+
+-- Returns the SNIs a stream route is matched by, or nil when it puts no
+-- restriction on the SNI. `sni` and `snis` are the singular and plural form of
+-- the same thing; the schema forbids carrying both.
+local function get_snis(route)
+    local snis = route.snis
+    if not snis then
+        if not route.sni then
+            return nil
+        end
+        snis = {route.sni}
+    end
+
+    if #snis == 0 then
+        return nil
+    end
+
+    return snis
 end
 
 
@@ -89,38 +111,40 @@ do
             if item.value.server_addr then
                 item.value.server_addr_matcher = core_ip.create_ip_matcher({item.value.server_addr})
             end
-            if not route.sni then
+            local snis = get_snis(route)
+            if not snis then
                 other_routes[other_routes_idx] = item
                 other_routes_idx = other_routes_idx + 1
                 goto CONTINUE
             end
 
-            local sni_rev = route.sni:reverse()
-            local stored = sni_to_items[sni_rev]
-            if stored then
-                core.table.insert(stored, item)
-                goto CONTINUE
-            end
-
-            sni_to_items[sni_rev] = {item}
-            tls_routes[tls_routes_idx] = {
-                paths = sni_rev,
-                filter_fun = function (vars, opts, ctx)
-                    local items = sni_to_items[sni_rev]
-                    for _, route in ipairs(items) do
-                        local hit = match_addrs(route, vars)
-                        if hit then
-                            ctx.matched_route = route
-                            return true
+            for _, sni in ipairs(snis) do
+                local sni_rev = sni:reverse()
+                local stored = sni_to_items[sni_rev]
+                if stored then
+                    core.table.insert(stored, item)
+                else
+                    sni_to_items[sni_rev] = {item}
+                    tls_routes[tls_routes_idx] = {
+                        paths = sni_rev,
+                        filter_fun = function (vars, opts, ctx)
+                            local items = sni_to_items[sni_rev]
+                            for _, route in ipairs(items) do
+                                local hit = match_addrs(route, vars)
+                                if hit then
+                                    ctx.matched_route = route
+                                    return true
+                                end
+                            end
+                            return false
+                        end,
+                        handler = function (ctx, sni_rev)
+                            -- done in the filter_fun
                         end
-                    end
-                    return false
-                end,
-                handler = function (ctx, sni_rev)
-                    -- done in the filter_fun
+                    }
+                    tls_routes_idx = tls_routes_idx + 1
                 end
-            }
-            tls_routes_idx = tls_routes_idx + 1
+            end
 
             ::CONTINUE::
         end
@@ -132,6 +156,8 @@ do
             end
 
             tls_router = router
+        else
+            tls_router = nil
         end
 
         return nil
@@ -140,26 +166,37 @@ end
 
 
 do
-    local match_opts = {}
-
     function _M.match(api_ctx)
-        if router_ver ~= user_routes.conf_version then
-            local err = create_router(user_routes.values)
+        -- Rebuild the router when stream_routes change OR when services change,
+        -- so updates to a referenced service (status, deletion, late sync from
+        -- etcd) are reflected in routing decisions for stream routes.
+        local _, cur_svc_ver = service_mod.services()
+        if router_ver ~= user_routes.conf_version
+           or service_ver ~= cur_svc_ver then
+            -- `values` is nil until the config source has delivered
+            -- /stream_routes for the first time, which in standalone mode can
+            -- happen after this subsystem is already accepting connections.
+            -- Treat that as "no stream route" instead of indexing a nil table:
+            -- the error would be thrown before router_ver is assigned, so every
+            -- later connection would take this branch and abort again.
+            local err = create_router(user_routes.values or {})
             if err then
                 return false, "failed to create router: " .. err
             end
 
             router_ver = user_routes.conf_version
+            service_ver = cur_svc_ver
         end
 
-        local sni = apisix_ssl.server_name()
+        local sni = apisix_ssl.server_name(nil, api_ctx.tls_passthrough)
         if sni and tls_router then
             local sni_rev = sni:reverse()
 
-            core.table.clear(match_opts)
+            local match_opts = core.tablepool.fetch("stream_router_match_opts", 0, 4)
             match_opts.vars = api_ctx.var
 
             local _, err = tls_router:dispatch(sni_rev, match_opts, api_ctx)
+            core.tablepool.release("stream_router_match_opts", match_opts)
             if err then
                 return false, "failed to match TLS router: " .. err
             end

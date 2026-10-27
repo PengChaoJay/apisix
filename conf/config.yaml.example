@@ -38,8 +38,13 @@ apisix:
   # proxy_protocol:                    # PROXY Protocol configuration
   #   listen_http_port: 9181           # APISIX listening port for HTTP traffic with PROXY protocol.
   #   listen_https_port: 9182          # APISIX listening port for HTTPS traffic with PROXY protocol.
-  #   enable_tcp_pp: true              # Enable the PROXY protocol when stream_proxy.tcp is set.
-  #   enable_tcp_pp_to_upstream: true  # Enable the PROXY protocol.
+  #   enable_tcp_pp: true              # Accept the PROXY protocol on every stream_proxy.tcp port.
+  #                                    # Acts as the default; override per port with the
+  #                                    # `proxy_protocol` field on a stream_proxy.tcp entry.
+  #   enable_tcp_pp_to_upstream: true  # Send the PROXY protocol to the upstream on every
+  #                                    # stream_proxy.tcp port. Acts as the default; override
+  #                                    # per port with `proxy_protocol_to_upstream` on a
+  #                                    # stream_proxy.tcp entry.
 
   enable_server_tokens: true           # If true, show APISIX version in the `Server` response header.
   extra_lua_path: ""                   # Extend lua_package_path to load third-party code.
@@ -65,6 +70,13 @@ apisix:
   delete_uri_tail_slash: false        # Delete the '/' at the end of the URI
   normalize_uri_like_servlet: false   # If true, use the same path normalization rules as the Java
                                       # servlet specification. See https://github.com/jakartaee/servlet/blob/master/spec/src/main/asciidoc/servlet-spec-body.adoc#352-uri-path-canonicalization, which is used in Tomcat.
+  match_uri_encoded_slash: false       # If true, keep an URL-encoded slash (%2F) encoded when matching
+                                      # routes, so it is treated as part of a path parameter instead of a
+                                      # path separator. Plugins in the rewrite/access phases still read the
+                                      # normalized (decoded) URI from ctx.var.uri; nginx forwards the
+                                      # original request line, so the upstream receives %2F unchanged.
+  max_post_args_readable_size: 64     # Cap (in MB) on the request body read when matching `post_arg.*`
+                                      # route predicates for JSON and multipart requests. Set to 0 to disable the limit.
 
   router:
     http: radixtree_host_uri    # radixtree_host_uri: match route by host and URI
@@ -79,9 +91,38 @@ apisix:
   #     - addr: 9100              # Set the TCP proxy listening ports.
   #       tls: true
   #     - addr: "127.0.0.1:9101"
+  #       proxy_protocol: true              # Accept the PROXY protocol on this port only.
+  #       proxy_protocol_to_upstream: true  # Send the PROXY protocol to the upstream on this
+  #                                         # port only. Both override the global
+  #                                         # proxy_protocol.enable_tcp_pp* defaults.
+  #     - addr: 9500
+  #       tls_passthrough: true      # Forward the TLS stream untouched, picking the upstream from
+  #                                  # the SNI in the prereaded ClientHello. The backend terminates
+  #                                  # the handshake, so payload-inspecting stream plugins
+  #                                  # (mqtt-proxy, xrpc, redis) and client certificate verification
+  #                                  # do not apply. Every connection on this port is passed
+  #                                  # through, whatever the stream_route says.
+  #     - addr: 9501
+  #       tls: true                  # Both flags open a mixed port: the listen only prereads, and
+  #       tls_passthrough: true      # each connection follows `tls_passthrough` on the stream_route
+  #                                  # it matches (default false). Costs one internal hop, so prefer
+  #                                  # a dedicated tls_passthrough port when the whole port passes
+  #                                  # through. That hop runs over unix sockets under logs/, and
+  #                                  # announces the client in a PROXY protocol header, so a local
+  #                                  # user able to connect to them could forge it. Keep logs/ off
+  #                                  # limits to untrusted local users, as it already has to be for
+  #                                  # stream_worker_events.sock.
+  #                                  # proxy_protocol_to_upstream is rejected on a mixed port: the
+  #                                  # upstream PROXY header would carry the internal unix socket
+  #                                  # as its destination. Use a dedicated listen instead.
+  #     - "2000-2100"              # port range (nginx native support)
+  #     - addr: "3000-3100"        # port range in table form
+  #     - addr: "127.0.0.1:4000-4100"  # address with port range in table form
+  #       tls: true
   #   udp:                        # Set the UDP proxy listening ports.
   #     - 9200
   #     - "127.0.0.1:9201"
+  #     - "9300-9310"              # port range
 
   # dns_resolver:                 # If not set, read from `/etc/resolv.conf`
   #   - 1.1.1.1
@@ -123,8 +164,8 @@ apisix:
     enable_encrypt_fields: true   # Whether enable encrypt fields specified in `encrypt_fields` in plugin schema.
     keyring:                      # This field is used to encrypt the private key of SSL and the `encrypt_fields`
                                   # in plugin schema.
-      - qeddd145sfvddff3          # Set the encryption key for AES-128-CBC. It should be a hexadecimal string
-                                  # of length 16.
+      - qeddd145sfvddff3          # Set the encryption key. A key of length 16 selects AES-128-CBC and a key
+                                  # of length 32 selects AES-256-CBC; any other length is rejected on startup.
       - edd1c9f0985e76a2          # If not set, APISIX saves the original data into etcd.
                                   # CAUTION: If you would like to update the key, add the new key as the
                                   # first item in the array and keep the older keys below the newly added
@@ -140,8 +181,30 @@ apisix:
                                         # When set to true, it overrides all upstream healthcheck configurations and globally disabling healthchecks.
 # trusted_addresses:              # When configured, APISIX will trust the `X-Forwarded-*` Headers
 #   - 127.0.0.1                   # passed in requests from the IP/CIDR in the list.
-#   - 172.18.0.0/16               # CAUTION: When not configured or the request from an untrusted address,
-                                  # APISIX will override `X-Forwarded-*` headers with trusted values.
+#   - 172.18.0.0/16               # CAUTION: When not configured or the request is from an untrusted
+                                  # address, APISIX overrides `X-Forwarded-Proto/Host/Port` with trusted
+                                  # values and clears the `Forwarded` header. For `X-Forwarded-For`: when
+                                  # `trusted_addresses` is configured and the request is from an untrusted
+                                  # address, it is reset so the upstream only sees the APISIX-observed
+                                  # connection IP; when `trusted_addresses` is not configured, it is
+                                  # preserved and the connection IP is appended (compatible default).
+                                  # The override happens in the NGINX configuration, before any Lua runs.
+                                  # Lua always sees the overridden values -- `core.request.header` and
+                                  # `ctx.var.http_x_forwarded_*` alike. At config level it differs:
+                                  # naming `$http_x_forwarded_proto`, `$http_x_forwarded_host`,
+                                  # `$http_x_forwarded_port` or `$http_forwarded` in an access log
+                                  # format, an `if`, or a `map` reads the value cached when the
+                                  # override was applied, which is what the client sent. Use `$scheme`,
+                                  # `$var_x_forwarded_host` and `$var_x_forwarded_port` for the
+                                  # overridden ones. `$http_x_forwarded_for` is not affected.
+                                  # What the client sent is kept in `$original_x_forwarded_proto`,
+                                  # `$original_x_forwarded_host`, `$original_x_forwarded_port`,
+                                  # `$original_x_forwarded_for` and `$original_forwarded` -- readable
+                                  # from a log format, or from Lua as `ctx.var.original_x_forwarded_*`,
+                                  # the same names the values were previously kept under, so a plugin
+                                  # reading them is unaffected. This matters most for X-Forwarded-For,
+                                  # which is cleared rather than overwritten when a trust boundary is
+                                  # configured and the peer is outside it.
   # fine tune the parameters of LRU cache for some features like secret
   lru:
     secret:
@@ -192,6 +255,13 @@ nginx_config:                     # Config for render the template to generate n
       upstream-healthcheck: 10m
 
   stream:
+    # real_ip_from:                          # https://nginx.org/en/docs/stream/ngx_stream_realip_module.html#set_real_ip_from
+    #   - 192.168.1.0/24                     # Trusted addresses that are known to send correct PROXY protocol
+    #                                        # headers. On a connection from a trusted address that carries an
+    #                                        # inbound PROXY protocol header, the client address is replaced by
+    #                                        # the one in the header. Only takes effect on ports that accept the
+    #                                        # PROXY protocol. Empty by default, so the client address is always
+    #                                        # the directly connected peer.
     enable_access_log: false                 # Enable stream proxy access logging.
     access_log: logs/access_stream.log       # Location of the stream access log.
     access_log_format: |
@@ -285,12 +355,17 @@ nginx_config:                     # Config for render the template to generate n
       plugin-limit-conn: 10m
       worker-events: 10m
       lrucache-lock: 10m
+      upstream-slow-start: 10m    # Slow start state of upstream nodes (`warm_up_conf`)
       balancer-ewma: 10m
       balancer-ewma-locks: 10m
       balancer-ewma-last-touched-at: 10m
       plugin-limit-req-redis-cluster-slot-lock: 1m
+      plugin-limit-count-lock: 10m
       plugin-limit-count-redis-cluster-slot-lock: 1m
       plugin-limit-conn-redis-cluster-slot-lock: 1m
+      plugin-graphql-limit-count: 10m
+      plugin-graphql-limit-count-reset-header: 10m
+      plugin-saml-auth-replay: 10m    # Assertions accepted by saml-auth when `replay_dict` names this dict
       tracing_buffer: 10m
       plugin-api-breaker: 10m
       etcd-cluster-health-check: 10m
@@ -364,9 +439,10 @@ nginx_config:                     # Config for render the template to generate n
 #       path: "logs/consul_kv.dump" # Location of the dump file.
 #       expire: 2592000             # Specify the expiration time of the dump file in units of seconds.
 #  consul:                          # Consul
-#    servers:                       # Consul address(es)
+#    servers:                       # Consul address(es), http or https
 #      - "http://127.0.0.1:8500"
 #      - "http://127.0.0.1:8600"
+#    ssl_verify: true               # Default true. Verify the certificate of https servers.
 #    skip_services:                 # Skip services during service discovery.
 #      - "service_a"
 #    timeout:
@@ -467,7 +543,9 @@ graphql:
 plugins:                           # plugin list (sorted by priority)
   - real-ip                        # priority: 23000
   - ai                             # priority: 22900
+  #- exit-transformer               # priority: 22950, disabled by default
   - client-control                 # priority: 22000
+  - proxy-buffering                # priority: 21991
   - proxy-control                  # priority: 21990
   - request-id                     # priority: 12015
   - zipkin                         # priority: 12011
@@ -488,47 +566,61 @@ plugins:                           # plugin list (sorted by priority)
   - chaitin-waf                    # priority: 2700
   - multi-auth                     # priority: 2600
   - openid-connect                 # priority: 2599
+  - saml-auth                      # priority: 2598
   - cas-auth                       # priority: 2597
   - authz-casbin                   # priority: 2560
   - authz-casdoor                  # priority: 2559
   - wolf-rbac                      # priority: 2555
+  - ldap-auth-advanced             # priority: 2541
   - ldap-auth                      # priority: 2540
   - hmac-auth                      # priority: 2530
   - basic-auth                     # priority: 2520
   - jwt-auth                       # priority: 2510
   - jwe-decrypt                    # priority: 2509
   - key-auth                       # priority: 2500
+  - dingtalk-auth                  # priority: 2430
+  - feishu-auth                    # priority: 2420
+  - acl                            # priority: 2410
   - consumer-restriction           # priority: 2400
   - attach-consumer-label          # priority: 2399
   - forward-auth                   # priority: 2002
   - opa                            # priority: 2001
   - authz-keycloak                 # priority: 2000
+  - data-mask                      # priority: 1500
   #- error-log-logger              # priority: 1091
   - proxy-cache                    # priority: 1085
   - body-transformer               # priority: 1080
+  - ai-request-rewrite             # priority: 1073
+  - ai-prompt-guard                # priority: 1072
   - ai-prompt-template             # priority: 1071
   - ai-prompt-decorator            # priority: 1070
-  - ai-prompt-guard                # priority: 1072
   - ai-rag                         # priority: 1060
+  - ai-aws-content-moderation      # priority: 1050
+  - ai-proxy-multi                 # priority: 1041
+  - ai-proxy                       # priority: 1040
+  - ai-cache                       # priority: 1035
   - ai-rate-limiting               # priority: 1030
-  - ai-aws-content-moderation      # priority: 1040 TODO: compare priority with other ai plugins
+  - ai-aliyun-content-moderation   # priority: 1029
+  - ai-lakera-guard                # priority: 1028
   - proxy-mirror                   # priority: 1010
+  - graphql-proxy-cache            # priority: 1009
   - proxy-rewrite                  # priority: 1008
   - workflow                       # priority: 1006
   - api-breaker                    # priority: 1005
+  - graphql-limit-count            # priority: 1004
   - limit-conn                     # priority: 1003
   - limit-count                    # priority: 1002
   - limit-req                      # priority: 1001
   #- node-status                   # priority: 1000
-  - ai-proxy                       # priority: 999
-  - ai-proxy-multi                 # priority: 998
   #- brotli                        # priority: 996
   - gzip                           # priority: 995
   #- server-info                    # priority: 990
+  - traffic-label                  # priority: 967
   - traffic-split                  # priority: 966
   - redirect                       # priority: 900
   - response-rewrite               # priority: 899
-  - mcp-bridge                     # priority: 510
+  - openapi-to-mcp                 # priority: 540
+  - oas-validator                  # priority: 512
   - degraphql                      # priority: 509
   - kafka-proxy                    # priority: 508
   #- dubbo-proxy                   # priority: 507
@@ -538,6 +630,7 @@ plugins:                           # plugin list (sorted by priority)
   - public-api                     # priority: 501
   - prometheus                     # priority: 500
   - datadog                        # priority: 495
+  #- error-page                    # priority: 450
   - lago                           # priority: 415
   - loki-logger                    # priority: 414
   - elasticsearch-logger           # priority: 413
@@ -589,6 +682,9 @@ stream_plugins:                    # stream plugin list (sorted by priority)
 #   protocols:
 #     - name: pingpong
 plugin_attr:          # Plugin attributes
+  ai-proxy:           # Plugin: ai-proxy, ai-proxy-multi
+    http_client: ngx_http_ffi_client # HTTP client the AI plugins use to reach the
+                      # LLM upstream: ngx_http_ffi_client or lua-resty-http.
   log-rotate:         # Plugin: log-rotate
     timeout: 10000    # maximum wait time for a log rotation(unit: millisecond)
     interval: 3600    # Set the log rotate interval in seconds.
@@ -628,6 +724,7 @@ plugin_attr:          # Plugin attributes
       ip: 127.0.0.1                         # Set the IP.
       port: 9091                            # Set the port.
     refresh_interval: 15                    # Set the interval for refreshing cached metric data. unit: second.
+    remove_expired_keys_interval: 3600       # Cleanup interval in seconds; capped at 3600. Non-positive values disable cleanup.
     # metrics:    # Create extra labels from nginx variables: https://nginx.org/en/docs/varindex.html
     #  http_status:
     #    expire: 0 # The expiration time after which metrics are removed. unit: second.
@@ -653,6 +750,14 @@ plugin_attr:          # Plugin attributes
     #   - 100
     #   - 200
     #   - 500
+    # llm_prompt_tokens_buckets:      # buckets for apisix_llm_prompt_tokens_dist histogram (unit: token)
+    #   - 100
+    #   - 1000
+    #   - 10000
+    # llm_completion_tokens_buckets:  # buckets for apisix_llm_completion_tokens_dist histogram (unit: token)
+    #   - 100
+    #   - 1000
+    #   - 10000
   server-info:                        # Plugin: server-info
     report_ttl: 60                    # Set the TTL in seconds for server info in etcd.
                                       # Maximum: 86400. Minimum: 3.

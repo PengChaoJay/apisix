@@ -41,13 +41,13 @@ description: loki-logger 插件通过 Loki HTTP API /loki/api/v1/push 将请求�
 ## 属性
 
 | 名称 | 类型 | 必选项 | 默认值 | 有效值 | 描述 |
-|--|---|---|---|---|
-| end_addrs | array[string] | 是 | | | Loki API URL，例如 `http://127.0.0.1:3100`。如果配置了多个端点，日志将被推送到列表中随机确定的端点。 |
-| end_uri | string | 否 | /loki/api/v1/push | | Loki 提取端点的 URI 路径。 |
+|--|---|---|---|---|---|
+| endpoint_addrs | array[string] | 是 | | | Loki API URL，例如 `http://127.0.0.1:3100`。如果配置了多个端点，日志将被推送到列表中随机确定的端点。 |
+| endpoint_uri | string | 否 | /loki/api/v1/push | | Loki 提取端点的 URI 路径。 |
 | tenant_id | string | 否 | fake | | Loki 租户 ID。根据 Loki 的 [多租户文档](https://grafana.com/docs/loki/latest/operations/multi-tenancy/#multi-tenancy)，在单租户下默认值设置为 `fake`。 |
 | headers | object | 否 |  |  | 请求头键值对（对 `X-Scope-OrgID` 和 `Content-Type` 的设置将会被忽略）。 |
 | log_labels | object | 否 | {job = "apisix"} | | Loki 日志标签。支持 [NGINX 变量](https://nginx.org/en/docs/varindex.html) 和值中的常量字符串。变量应以 `$` 符号为前缀。例如，标签可以是 `{"origin" = "apisix"}` 或 `{"origin" = "$remote_addr"}`。|
-| ssl_verify | boolean | 否 | true | | 如果为 true，则验证 Loki 的 SSL 证书。|
+| ssl_verify | boolean | 否 | false | | 如果为 true，则验证 Loki 的 SSL 证书。|
 | timeout | integer | 否 | 3000 | [1, 60000] | Loki 服务 HTTP 调用的超时时间（以毫秒为单位）。|
 | keepalive | boolean | 否 | true | | 如果为 true，则保持连接以应对多个请求。|
 | keepalive_timeout | integer | 否 | 60000 | >=1000 | Keepalive 超时时间（以毫秒为单位）。|
@@ -56,19 +56,21 @@ description: loki-logger 插件通过 Loki HTTP API /loki/api/v1/push 将请求�
 | name | string | 否 | loki-logger | | 批处理器插件的唯一标识符。如果使用 [Prometheus](./prometheus.md) 监控 APISIX 指标，则名称会导出到 `apisix_batch_process_entries`。 |
 | include_req_body | boolean | 否 | false | | 如果为 true，则将请求正文包含在日志中。请注意，如果请求正文太大而无法保存在内存中，则由于 NGINX 的限制而无法记录。 |
 | include_req_body_expr | array[array] | 否 | | |一个或多个 [lua-resty-expr](https://github.com/api7/lua-resty-expr) 形式条件的数组。在 `include_req_body` 为 true 时使用。仅当此处配置的表达式计算结果为 true 时，才会记录请求正文。|
+| max_req_body_bytes | integer | 否 | 524288 | >=1 | 记录请求正文的最大字节数。如果请求正文超过此值，则会在记录前截断。|
 | include_resp_body | boolean | 否 | false | | 如果为 true，则将响应正文包含在日志中。|
 | include_resp_body_expr | array[array] | 否 | | | 一个或多个 [lua-resty-expr](https://github.com/api7/lua-resty-expr) 形式条件的数组。在 `include_resp_body` 为 true 时使用。仅当此处配置的表达式计算结果为 true 时，才会记录响应正文。|
+| max_resp_body_bytes | integer | 否 | 524288 | >=1 | 记录响应正文的最大字节数。如果响应正文超过此值，则会在记录前截断。|
 
 该插件支持使用批处理器对条目（日志/数据）进行批量聚合和处理，避免了频繁提交数据的需求。批处理器每隔 `5` 秒或当队列中的数据达到 `1000` 时提交数据。有关更多信息或设置自定义配置，请参阅 [批处理器](../batch-processor.md#configuration)。
 
 ## Plugin Metadata
 
-您还可以使用 [Plugin Metadata](../terminology/plugin-metadata.md) 全局配置日志格式，该 Plugin Metadata 配置所有 `loki-logger` 插件实例的日志格式。如果在单个插件实例上配置的日志格式与在 Plugin Metadata 上配置的日志格式不同，则在单个插件实例上配置的日志格式优先。
+你还可以使用 [Plugin Metadata](../terminology/plugin-metadata.md) 全局配置日志格式，该 Plugin Metadata 配置所有 `loki-logger` 插件实例的日志格式。如果在单个插件实例上配置的日志格式与在 Plugin Metadata 上配置的日志格式不同，则在单个插件实例上配置的日志格式优先。
 
-| 名称 | 类型 | 必选项 | 默认值 | 描述 |
-|------|------|----------|--|-------------|
-| log_format | object | 否 |  | 日志格式以 JSON 的键值对声明。值支持字符串和嵌套对象（最多五层，超出部分将被截断）。字符串中可通过在前面加上 `$` 来引用 [APISIX 变量](../apisix-variable.md) 和 [NGINX 变量](http://nginx.org/en/docs/varindex.html)。 |
-| max_pending_entries | integer | 否 | | | 在批处理器中开始删除待处理条目之前可以购买的最大待处理条目数。|
+| 名称 | 类型 | 必选项 | 默认值 | 有效值 | 描述 |
+|------|------|--------|--------|--------|------|
+| log_format | object | 否 |  |  | 日志格式以 JSON 的键值对声明。值支持字符串和嵌套对象（最多五层，超出部分将被截断）。字符串中可通过在前面加上 `$` 来引用 [APISIX 变量](../apisix-variable.md) 和 [NGINX 变量](http://nginx.org/en/docs/varindex.html)。 |
+| max_pending_entries | integer | 否 | 8192 | >= 1 | 待处理条目数的上限。积压超过该值后新条目会被丢弃，避免日志服务变慢或不可达时 worker 内存无限增长。该上限对应的内存开销参见 [批处理器](../batch-processor.md#限制积压条目数)。 |
 
 ## 示例
 
@@ -89,11 +91,11 @@ docker run -d --name=apisix-quickstart-grafana \
   grafana/grafana-oss
 ```
 
-要连接 Loki 和 Grafana，请访问 Grafana，网址为 [`http://localhost:3000`](http://localhost:3000)。在 __Connections > Data sources__ 下，添加新数据源并选择 Loki。您的连接 URL 应遵循 `http://{your_ip_address}:3100` 的格式。保存新数据源时，Grafana 还应测试连接，您应该会看到 Grafana 通知数据源已成功连接。
+要连接 Loki 和 Grafana，请访问 Grafana，网址为 [`http://localhost:3000`](http://localhost:3000)。在 __Connections > Data sources__ 下，添加新数据源并选择 Loki。你的连接 URL 应遵循 `http://{your_ip_address}:3100` 的格式。保存新数据源时，Grafana 还应测试连接，你应该会看到 Grafana 通知数据源已成功连接。
 
 :::note
 
-您可以这样从 `config.yaml` 中获取 `admin_key` 并存入环境变量：
+你可以这样从 `config.yaml` 中获取 `admin_key` 并存入环境变量：
 
 ```bash
 admin_key=$(yq '.deployment.admin.admin_key[0].key' conf/config.yaml | sed 's/"//g')
@@ -133,9 +135,9 @@ curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
 curl "http://127.0.0.1:9080/anything"
 ```
 
-您应该会收到所有请求的“HTTP/1.1 200 OK”响应。
+你应该会收到所有请求的“HTTP/1.1 200 OK”响应。
 
-导航到 [Grafana explore view](http://localhost:3000/explore) 并运行查询 `job = apisix`。您应该会看到与您的请求相对应的许多日志，例如以下内容：
+导航到 [Grafana explore view](http://localhost:3000/explore) 并运行查询 `job = apisix`。你应该会看到与你的请求相对应的许多日志，例如以下内容：
 
 ```json
 {
@@ -179,7 +181,7 @@ curl "http://127.0.0.1:9080/anything"
 }
 ```
 
-这验证了 Loki 已从 APISIX 接收日志。您还可以在 Grafana 中创建仪表板，以进一步可视化和分析日志。
+这验证了 Loki 已从 APISIX 接收日志。你还可以在 Grafana 中创建仪表板，以进一步可视化和分析日志。
 
 ### 使用 Plugin Metadata 自定义日志格式
 
@@ -228,9 +230,9 @@ curl "http://127.0.0.1:9180/apisix/admin/plugin_metadata/loki-logger" -X PUT \
 curl -i "http://127.0.0.1:9080/anything"
 ```
 
-您应该会收到 `HTTP/1.1 200 OK` 响应。
+你应该会收到 `HTTP/1.1 200 OK` 响应。
 
-导航到 [Grafana explore view](http://localhost:3000/explore) 并运行查询 `job = apisix`。您应该会看到与您的请求相对应的日志条目，类似于以下内容：
+导航到 [Grafana explore view](http://localhost:3000/explore) 并运行查询 `job = apisix`。你应该会看到与你的请求相对应的日志条目，类似于以下内容：
 
 ```json
 {
@@ -265,9 +267,9 @@ curl "http://127.0.0.1:9180/apisix/admin/routes/loki-logger-route" -X PATCH \
 curl -i "http://127.0.0.1:9080/anything"
 ```
 
-您应该会收到 `HTTP/1.1 200 OK` 响应。
+你应该会收到 `HTTP/1.1 200 OK` 响应。
 
-导航到 [Grafana explore view](http://localhost:3000/explore) 并重新运行查询 `job = apisix`。您应该会看到与您的请求相对应的日志条目，与路由上配置的格式一致，类似于以下内容：
+导航到 [Grafana explore view](http://localhost:3000/explore) 并重新运行查询 `job = apisix`。你应该会看到与你的请求相对应的日志条目，与路由上配置的格式一致，类似于以下内容：
 
 ```json
 {
@@ -311,9 +313,9 @@ curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
 curl -i "http://127.0.0.1:9080/anything?log_body=yes" -X POST -d '{"env": "dev"}'
 ```
 
-您应该会收到 `HTTP/1.1 200 OK` 响应。
+你应该会收到 `HTTP/1.1 200 OK` 响应。
 
-导航到 [Grafana explore view](http://localhost:3000/explore) 并重新运行查询 `job = apisix`。您应该会看到与您的请求相对应的日志条目，与路由上配置的格式一致，类似于以下内容：
+导航到 [Grafana explore view](http://localhost:3000/explore) 并重新运行查询 `job = apisix`。你应该会看到与你的请求相对应的日志条目，与路由上配置的格式一致，类似于以下内容：
 
 ```json
 {
@@ -342,9 +344,9 @@ curl -i "http://127.0.0.1:9080/anything?log_body=yes" -X POST -d '{"env": "dev"}
 curl -i "http://127.0.0.1:9080/anything" -X POST -d '{"env": "dev"}'
 ```
 
-您应该会收到 `HTTP/1.1 200 OK` 响应。
+你应该会收到 `HTTP/1.1 200 OK` 响应。
 
-导航到 [Grafana explore view](http://localhost:3000/explore) 并重新运行查询 `job = apisix`。您应该会看到与您的请求相对应的日志条目，与路由上配置的格式一致，类似于以下内容：
+导航到 [Grafana explore view](http://localhost:3000/explore) 并重新运行查询 `job = apisix`。你应该会看到与你的请求相对应的日志条目，与路由上配置的格式一致，类似于以下内容：
 
 ```json
 {
@@ -366,13 +368,13 @@ curl -i "http://127.0.0.1:9080/anything" -X POST -d '{"env": "dev"}'
 
 :::info
 
-如果您除了将 `include_req_body` 或 `include_resp_body` 设置为 `true` 之外还自定义了 `log_format`，则插件不会在日志中包含正文。
+如果你除了将 `include_req_body` 或 `include_resp_body` 设置为 `true` 之外还自定义了 `log_format`，则插件不会在日志中包含正文。
 
-作为一种解决方法，您可以在日志格式中使用 NGINX 变量 `$request_body`，例如：
+作为一种解决方法，你可以在日志格式中使用 NGINX 变量 `$request_body`，例如：
 
 ```json
 {
-  "kafka-logger": {
+  "loki-logger": {
     ...,
     "log_format": {"body": "$request_body"}
   }

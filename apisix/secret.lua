@@ -225,22 +225,26 @@ local function fetch(uri, use_cache)
     end
 
     if not use_cache then
-        local val, err = fetch_by_uri(uri)
-        if err then
-            core.log.error("failed to fetch secret value: ", err)
-            return nil
-        end
-        return val
+        return fetch_by_uri(uri)
     end
 
-    return secrets_cache(uri, "", fetch_by_uri, uri)
+    -- pass the secrets conf_version so the cache re-resolves when /secrets changes
+    local version = secrets and secrets.conf_version or ""
+    return secrets_cache(uri, version, fetch_by_uri, uri)
 end
 
 local function retrieve_refs(refs, use_cache)
     for k, v in pairs(refs) do
         local typ = type(v)
         if typ == "string" then
-            refs[k] = fetch(v, use_cache) or v
+            local val, err = fetch(v, use_cache)
+            if val == nil and _M.is_secret_ref(v) then
+                -- an unresolved reference is kept as-is, so it would otherwise
+                -- be used verbatim as a password, key or token
+                core.log.error("failed to resolve secret reference: ", v,
+                               ", field: ", k, ", err: ", err or "no value")
+            end
+            refs[k] = val or v
         elseif typ == "table" then
             retrieve_refs(v, use_cache)
         end
@@ -256,5 +260,78 @@ function _M.fetch_secrets(refs, use_cache)
     local new_refs = core.table.deepcopy(refs)
     return retrieve_refs(new_refs, use_cache)
 end
+
+
+-- Used as jsonschema skip_validation hook: signature is (value, schema).
+-- Returns true to skip validation when value is a secret reference ($secret:// or $env://).
+-- Only skips for fields whose schema accepts string values.
+function _M.is_secret_ref(value, schema)
+    if type(value) ~= "string" or byte(value, 1) ~= 36 then  -- '$'
+        return false
+    end
+    if schema and schema.type and schema.type ~= "string" then
+        return false
+    end
+    if not (string.has_prefix(value, PREFIX)
+            or string.has_prefix(upper(value), core.env.PREFIX)) then
+        return false
+    end
+
+    return true
+end
+
+
+local function _has_secret_ref(t, visited)
+    if visited[t] then
+        return false
+    end
+    visited[t] = true
+    for _, v in pairs(t) do
+        if type(v) == "string" then
+            if _M.is_secret_ref(v) then
+                return true
+            end
+        elseif type(v) == "table" then
+            if _has_secret_ref(v, visited) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+
+function _M.has_secret_ref(conf)
+    if type(conf) ~= "table" then
+        return false
+    end
+    return _has_secret_ref(conf, {})
+end
+
+
+local function _collect_secret_values(t, vals, use_cache, visited)
+    if visited[t] then
+        return
+    end
+    visited[t] = true
+    for _, v in pairs(t) do
+        if type(v) == "string" and _M.is_secret_ref(v) then
+            vals[v] = fetch(v, use_cache)
+        elseif type(v) == "table" then
+            _collect_secret_values(v, vals, use_cache, visited)
+        end
+    end
+end
+
+
+function _M.collect_secret_values(conf, use_cache)
+    local vals = {}
+    if type(conf) ~= "table" then
+        return vals
+    end
+    _collect_secret_values(conf, vals, use_cache, {})
+    return vals
+end
+
 
 return _M

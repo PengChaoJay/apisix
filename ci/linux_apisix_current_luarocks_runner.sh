@@ -27,6 +27,14 @@ do_install() {
     ./ci/linux-install-openresty.sh
     ./utils/linux-install-luarocks.sh
     ./ci/linux-install-etcd-client.sh
+
+    # install nodejs
+    install_nodejs
+
+    # install common node test suite
+    pushd t
+    pnpm install
+    popd
 }
 
 script() {
@@ -64,7 +72,7 @@ script() {
     set_coredns
 
     # install test dependencies
-    sudo pip install requests
+    sudo pip install requests aiohttp aiohttp-sse
 
     # dismiss "maximum number of open file descriptors too small" warning
     ulimit -n 10240

@@ -23,7 +23,8 @@ local ipairs = ipairs
 local table_insert = core.table.insert
 local table_concat = core.table.concat
 
-local batch_processor_manager = bp_manager_mod.new("sys logger")
+-- shared by the http and the stream syslog plugin, both named "syslog"
+local batch_processor_manager = bp_manager_mod.new("sys logger", "syslog")
 
 local lrucache = core.lrucache.new({
     ttl = 300, count = 512, serial_creating = true,
@@ -88,7 +89,6 @@ function _M.push_entry(conf, ctx, entry)
 
     local rfc5424_data = rfc5424.encode("SYSLOG", "INFO", ctx.var.host,
                                 "apisix", ctx.var.pid, json_str)
-    core.log.info("collect_data:" .. rfc5424_data)
     if batch_processor_manager:add_entry(conf, rfc5424_data) then
         return
     end
@@ -99,7 +99,6 @@ function _M.push_entry(conf, ctx, entry)
         local items = {}
         for _, e in ipairs(entries) do
             table_insert(items, e)
-            core.log.debug("buffered logs:", e)
         end
 
         return send_syslog_data(conf, table_concat(items), cp_ctx)

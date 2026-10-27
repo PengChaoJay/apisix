@@ -27,6 +27,19 @@ add_block_preprocessor(sub {
         $block->set_value("request", "GET /t");
     }
 
+        my $extra_init_by_lua = <<_EOC_;
+    local bp_manager = require("apisix.utils.batch-processor-manager")
+    local core = require("apisix.core")
+    local old_f = bp_manager.add_entry_to_new_processor
+    bp_manager.add_entry_to_new_processor = function(self, conf, entry, ctx, func)
+        ngx.log(ngx.INFO, "batch_entry: ", entry.data or core.json.encode(entry))
+        return old_f(self, conf, entry, ctx, func)
+    end
+_EOC_
+
+    if (!defined $block->extra_init_by_lua) {
+         $block->set_value("extra_init_by_lua", $extra_init_by_lua);
+    }
 });
 
 run_tests();
@@ -522,6 +535,7 @@ failed to check the configuration of plugin sls-logger
                 ngx.say(err)
                 return
             end
+            ngx.sleep(0.5)
             ngx.say("done")
         }
     }
@@ -530,3 +544,23 @@ GET /t
 --- response_body
 done
 --- no_error_log
+
+
+
+=== TEST 18: ssl_verify defaults to true
+--- config
+    location /t {
+        content_by_lua_block {
+            local plugin = require("apisix.plugins.sls-logger")
+            local conf = {
+                host = "127.0.0.1", port = 10009,
+                project = "p", logstore = "l",
+                access_key_id = "id", access_key_secret = "sec"
+            }
+            local ok, err = plugin.check_schema(conf)
+            if not ok then ngx.say("check failed: ", err); return end
+            ngx.say("ssl_verify=", tostring(conf.ssl_verify))
+        }
+    }
+--- response_body
+ssl_verify=true

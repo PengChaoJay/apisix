@@ -31,6 +31,7 @@ local new_tab = require("table.new")
 local log = ngx.log
 local WARN = ngx.WARN
 local ipairs = ipairs
+local pairs = pairs
 local select = select
 local setmetatable = setmetatable
 local string = string
@@ -363,7 +364,40 @@ local function luasocket_tcp()
 end
 
 
+-- lua-cjson options are per-instance, and cjson.new() always starts from the
+-- compile-time defaults instead of inheriting the singleton's configuration.
+-- core/json.lua only enables decode_array_with_array_mt on the `cjson.safe`
+-- singleton, so every dependency holding a private instance (lua-resty-session,
+-- lua-resty-healthcheck, lua-resty-worker-events, lua-resty-aws, ...) decodes
+-- arrays without the array metatable, and an empty array is then re-encoded as
+-- an object. Enable the option on both singletons and let every instance created
+-- afterwards inherit it. This only changes the default: a library explicitly
+-- calling decode_array_with_array_mt(false) on its own instance still wins.
+--
+-- encode_escape_forward_slash is set here as well. It looks redundant today,
+-- because in the bundled lua-cjson that setter mutates a shared escape table and
+-- therefore already applies process-wide, including to instances created before
+-- it was called. Upstream has since made it per-instance, so once a runtime
+-- upgrade picks that up, every private instance would silently go back to
+-- escaping `/`. Setting it here pins the current behaviour instead of relying on
+-- that implementation detail.
+local function patch_cjson(cjson)
+    cjson.decode_array_with_array_mt(true)
+    cjson.encode_escape_forward_slash(false)
+
+    local original_new = cjson.new
+    cjson.new = function (...)
+        local instance = original_new(...)
+        patch_cjson(instance)
+        return instance
+    end
+end
+
+
 function _M.patch()
+    patch_cjson(require("cjson"))
+    patch_cjson(require("cjson.safe"))
+
     -- make linter happy
     -- luacheck: ignore
     ngx_socket.tcp = function ()
@@ -377,6 +411,33 @@ function _M.patch()
 
     ngx_socket.udp = function ()
         return patch_udp_socket(original_udp())
+    end
+
+    -- Patch ngx.req.set_body_data to invalidate the parsed request body cache
+    -- in api_ctx. This ensures that body lookups and post_arg.* variable
+    -- lookups after a body rewrite always reflect the new body content.
+    local _orig_set_body_data = ngx.req.set_body_data
+    ngx.req.set_body_data = function(data)
+        local api_ctx = ngx.ctx.api_ctx
+        if api_ctx and api_ctx._request_body_table then
+            api_ctx._request_body_table = nil
+            api_ctx._request_body_type = nil
+            local var = api_ctx.var
+            local cache = var and var._cache
+            if cache then
+                local keys_to_clear = {}
+                for key in pairs(cache) do
+                    if type(key) == "string" and key:sub(1, 9) == "post_arg." then
+                        keys_to_clear[#keys_to_clear + 1] = key
+                    end
+                end
+
+                for i = 1, #keys_to_clear do
+                    cache[keys_to_clear[i]] = nil
+                end
+            end
+        end
+        return _orig_set_body_data(data)
     end
 end
 

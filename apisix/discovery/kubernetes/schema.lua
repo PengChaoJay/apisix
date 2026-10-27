@@ -102,7 +102,7 @@ local default_weight_schema = {
 local shared_size_schema = {
     type = "string",
     pattern = [[^[1-9][0-9]*m$]],
-    default = "1m",
+    default = "64m",
 }
 
 local watch_endpoint_slices_schema = {
@@ -128,6 +128,9 @@ return {
                             type = "string",
                             oneOf = port_patterns,
                             default = "${KUBERNETES_SERVICE_PORT}",
+                        },
+                        ssl_verify = {
+                            type = "boolean",
                         },
                     },
                     default = {
@@ -189,6 +192,9 @@ return {
                             port = {
                                 type = "string",
                                 oneOf = port_patterns,
+                            },
+                            ssl_verify = {
+                                type = "boolean",
                             },
                         },
                         required = { "host", "port" }

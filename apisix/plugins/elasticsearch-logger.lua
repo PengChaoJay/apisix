@@ -14,15 +14,17 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 --
-
 local core            = require("apisix.core")
 local http            = require("resty.http")
 local log_util        = require("apisix.utils.log-util")
 local bp_manager_mod  = require("apisix.utils.batch-processor-manager")
-local plugin          = require("apisix.plugin")
 local ngx             = ngx
+local ngx_re          = ngx.re
 local str_format      = core.string.format
 local math_random     = math.random
+local os_date         = os.date
+local pcall           = pcall
+local type            = type
 local pairs           = pairs
 
 local plugin_name = "elasticsearch-logger"
@@ -52,6 +54,7 @@ local schema = {
             required = {"index"}
         },
         log_format = {type = "object"},
+        log_format_extra = {type = "object"},
         auth = {
             type = "object",
             properties = {
@@ -104,8 +107,10 @@ local schema = {
                 type = "array"
             }
         },
+        max_req_body_bytes = { type = "integer", minimum = 1, default = 524288 },
+        max_resp_body_bytes = { type = "integer", minimum = 1, default = 524288 },
     },
-    encrypt_fields = {"auth.password"},
+    encrypt_fields = {"auth.password", "headers"},
     oneOf = {
         {required = {"endpoint_addr", "field"}},
         {required = {"endpoint_addrs", "field"}}
@@ -116,13 +121,11 @@ local schema = {
 local metadata_schema = {
     type = "object",
     properties = {
-        log_format = {
+        log_format_extra = {
             type = "object"
         },
-        max_pending_entries = {
-            type = "integer",
-            description = "maximum number of pending entries in the batch processor",
-            minimum = 1,
+        log_format = {
+            type = "object"
         },
     },
 }
@@ -133,7 +136,7 @@ local _M = {
     priority = 413,
     name = plugin_name,
     schema = batch_processor_manager:wrap_schema(schema),
-    metadata_schema = metadata_schema,
+    metadata_schema = batch_processor_manager:wrap_metadata_schema(metadata_schema),
 }
 
 
@@ -199,11 +202,41 @@ local function get_es_major_version(uri, conf)
 end
 
 
-local function get_logger_entry(conf, ctx)
+local function replace_time(m)
+    local time_format = m[1]
+    -- os.date returns a *table* (not a string) for the "*t"/"!*t" formats, and
+    -- on non-LuaJIT runtimes can raise on a bad strftime escape. Either way the
+    -- result would be stringified into a garbage index name, so require a
+    -- string and fall back to an empty replacement otherwise.
+    local ok, time = pcall(os_date, time_format)
+    if not ok or type(time) ~= "string" then
+        core.log.error("failed to parse time format: ", time_format)
+        return ""
+    end
+    return time
+end
+
+
+local function resolve_index_vars(index, var)
+    local new_index, _, err = ngx_re.gsub(index, "(?<!\\$){([^}]*)}", replace_time, "jo")
+    if not new_index then
+        core.log.error("failed to substitute time format: ", err)
+    end
+
+    new_index, err = core.utils.resolve_var(new_index or index, var)
+    if not new_index then
+        core.log.error("failed to resolve APISIX variable from index: ", err)
+    end
+
+    return new_index or index
+end
+
+
+local function get_logger_entry(conf, ctx, index)
     local entry = log_util.get_log_entry(plugin_name, conf, ctx)
     local body = {
         index = {
-            _index = conf.field.index
+            _index = index
         }
     }
     -- for older version type is required
@@ -213,6 +246,7 @@ local function get_logger_entry(conf, ctx)
     return core.json.encode(body) .. "\n" ..
         core.json.encode(entry) .. "\n"
 end
+
 
 local function fetch_and_update_es_version(conf)
     if conf._version then
@@ -264,8 +298,6 @@ local function send_to_elasticsearch(conf, entries)
         end
     end
 
-    core.log.info("uri: ", uri, ", body: ", body)
-
     httpc:set_timeout(conf.timeout * 1000)
     local resp, err = httpc:request_uri(uri, {
         ssl_verify = conf.ssl_verify,
@@ -290,19 +322,21 @@ function _M.body_filter(conf, ctx)
     log_util.collect_body(conf, ctx)
 end
 
-function _M.access(conf)
+
+function _M.access(conf, ctx)
     -- fetch_and_update_es_version will call ES server only the first time
     -- so this should not amount to considerable overhead
     fetch_and_update_es_version(conf)
+
+    log_util.check_and_read_req_body(conf, ctx)
 end
 
-function _M.log(conf, ctx)
-    local metadata = plugin.plugin_metadata(plugin_name)
-    local max_pending_entries = metadata and metadata.value and
-                                metadata.value.max_pending_entries or nil
-    local entry = get_logger_entry(conf, ctx)
 
-    if batch_processor_manager:add_entry(conf, entry, max_pending_entries) then
+function _M.log(conf, ctx)
+    local index = resolve_index_vars(conf.field.index, ctx.var)
+    local entry = get_logger_entry(conf, ctx, index)
+
+    if batch_processor_manager:add_entry(conf, entry) then
         return
     end
 
@@ -310,9 +344,9 @@ function _M.log(conf, ctx)
         return send_to_elasticsearch(conf, entries)
     end
 
-    batch_processor_manager:add_entry_to_new_processor(conf, entry, ctx,
-                                                       process, max_pending_entries)
+    batch_processor_manager:add_entry_to_new_processor(conf, entry, ctx, process)
 end
 
+_M._resolve_index_vars = resolve_index_vars
 
 return _M

@@ -36,7 +36,8 @@ plugin_attr:
 " > conf/config.yaml
 
 make run
-sleep 0.5
+wait_for_tcp 127.0.0.1 9180
+wait_for_tcp 127.0.0.1 9100
 
 admin_key=$(yq '.deployment.admin.admin_key[0].key' conf/config.yaml | sed 's/"//g')
 curl -v -k -i -m 20 -o /dev/null -s -X PUT http://127.0.0.1:9180/apisix/admin/stream_routes/1 \
@@ -55,11 +56,22 @@ curl -v -k -i -m 20 -o /dev/null -s -X PUT http://127.0.0.1:9180/apisix/admin/st
         }
     }'
 
-curl http://127.0.0.1:9100 || true
-sleep 1 # wait for sync
-
-out="$(curl http://127.0.0.1:9091/apisix/prometheus/metrics)"
-if ! echo "$out" | grep "apisix_stream_connection_total{route=\"1\"} 1" > /dev/null; then
+# Retry trigger + read: route-propagation and exporter-cache populate are both async.
+# Counter can exceed 1 across retries, so match any positive integer.
+ok=0
+deadline=$(( $(date +%s) + 20 ))
+{ set +x; } 2>/dev/null
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    curl -s --connect-timeout 1 --max-time 2 http://127.0.0.1:9100 >/dev/null 2>&1 || true
+    if curl -s --connect-timeout 1 --max-time 2 http://127.0.0.1:9091/apisix/prometheus/metrics \
+         | grep -qE 'apisix_stream_connection_total\{route="1",service="",service_id=""\} [1-9][0-9]*'; then
+        ok=1
+        break
+    fi
+    sleep 0.5
+done
+set -x
+if [ "$ok" -ne 1 ]; then
     echo "failed: prometheus can't work in stream subsystem"
     exit 1
 fi
@@ -83,13 +95,25 @@ plugin_attr:
 " > conf/config.yaml
 
 make run
-sleep 0.5
+wait_for_tcp 127.0.0.1 9100
 
-curl http://127.0.0.1:9100 || true
-sleep 1 # wait for sync
-
-out="$(curl http://127.0.0.1:9091/apisix/prometheus/metrics)"
-if ! echo "$out" | grep "apisix_stream_connection_total{route=\"1\"} 1" > /dev/null; then
+# Same retry pattern as the first block; `|| true` on the curl cmd-subst so curl
+# failure mid-loop doesn't trip `set -e`.
+ok=0
+deadline=$(( $(date +%s) + 20 ))
+out=""
+{ set +x; } 2>/dev/null
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    curl -s --connect-timeout 1 --max-time 2 http://127.0.0.1:9100 >/dev/null 2>&1 || true
+    out="$(curl -s --connect-timeout 1 --max-time 2 http://127.0.0.1:9091/apisix/prometheus/metrics || true)"
+    if echo "$out" | grep -qE 'apisix_stream_connection_total\{route="1",service="",service_id=""\} [1-9][0-9]*'; then
+        ok=1
+        break
+    fi
+    sleep 0.5
+done
+set -x
+if [ "$ok" -ne 1 ]; then
     echo "failed: prometheus can't work in stream subsystem"
     exit 1
 fi
@@ -100,3 +124,42 @@ if ! echo "$out" | grep "apisix_node_info{hostname=" > /dev/null; then
 fi
 
 echo "passed: prometheus works when only stream is enabled"
+
+# the http subsystem exists only to export metrics here, yet every process
+# still reports its own Lua VMs and connection slots
+ok=0
+deadline=$(( $(date +%s) + 20 ))
+{ set +x; } 2>/dev/null
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    out="$(curl -s --connect-timeout 1 --max-time 2 http://127.0.0.1:9091/apisix/prometheus/metrics || true)"
+    if echo "$out" | grep -qE 'apisix_nginx_timers\{process="worker-0",subsystem="stream",state="running"\} [0-9]+$' \
+        && echo "$out" | grep -qE 'apisix_nginx_lua_memory_bytes\{process="privileged-agent",subsystem="http"\} [1-9]' \
+        && echo "$out" | grep -qE 'apisix_nginx_process_connections_max\{process="privileged-agent"\} 512$'; then
+        ok=1
+        break
+    fi
+    sleep 0.5
+done
+set -x
+if [ "$ok" -ne 1 ]; then
+    echo "failed: process metrics are missing when only stream is enabled"
+    exit 1
+fi
+
+echo "passed: process metrics work when only stream is enabled"
+
+# the export-only http block runs on the same timer limits as the stream
+# subsystem, so the reported limits hold for every Lua VM
+http_block="$(sed -n '/^http {/,/^}/p' conf/nginx.conf)"
+if ! echo "$http_block" | grep -q "lua_max_pending_timers 16384;" \
+    || ! echo "$http_block" | grep -q "lua_max_running_timers 4096;"; then
+    echo "failed: the stream-only http block does not carry the timer limits"
+    exit 1
+fi
+
+if ! echo "$out" | grep -qE 'apisix_nginx_timers_max\{state="pending"\} 16384$'; then
+    echo "failed: nginx_timers_max does not report the configured limit"
+    exit 1
+fi
+
+echo "passed: the stream-only http block carries the timer limits"

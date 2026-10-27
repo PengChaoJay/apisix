@@ -133,6 +133,7 @@ deps: install-runtime
 	$(eval ENV_LUAROCKS_VER := $(shell $(ENV_LUAROCKS) --version | grep -E -o "luarocks [0-9]+."))
 	@if [ '$(ENV_LUAROCKS_VER)' = 'luarocks 3.' ]; then \
 		mkdir -p ~/.luarocks; \
+		$(ENV_LUAROCKS) config $(ENV_LUAROCKS_FLAG_LOCAL) variables.OPENSSL_DIR $(ENV_OPENSSL_PREFIX); \
 		$(ENV_LUAROCKS) config $(ENV_LUAROCKS_FLAG_LOCAL) variables.OPENSSL_LIBDIR $(addprefix $(ENV_OPENSSL_PREFIX), /lib); \
 		$(ENV_LUAROCKS) config $(ENV_LUAROCKS_FLAG_LOCAL) variables.OPENSSL_INCDIR $(addprefix $(ENV_OPENSSL_PREFIX), /include); \
 		$(ENV_LUAROCKS) config $(ENV_LUAROCKS_FLAG_LOCAL) variables.YAML_DIR $(ENV_LIBYAML_INSTALL_PREFIX); \
@@ -308,6 +309,9 @@ install: runtime
 	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/ext-plugin
 	$(ENV_INSTALL) apisix/plugins/ext-plugin/*.lua $(ENV_INST_LUADIR)/apisix/plugins/ext-plugin/
 
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/graphql-limit-count
+	$(ENV_INSTALL) apisix/plugins/graphql-limit-count/*.lua $(ENV_INST_LUADIR)/apisix/plugins/graphql-limit-count/
+
 	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/grpc-transcode
 	$(ENV_INSTALL) apisix/plugins/grpc-transcode/*.lua $(ENV_INST_LUADIR)/apisix/plugins/grpc-transcode/
 
@@ -322,6 +326,12 @@ install: runtime
 
 	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/limit-count
 	$(ENV_INSTALL) apisix/plugins/limit-count/*.lua $(ENV_INST_LUADIR)/apisix/plugins/limit-count/
+
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/limit-count/sliding-window
+	$(ENV_INSTALL) apisix/plugins/limit-count/sliding-window/*.lua $(ENV_INST_LUADIR)/apisix/plugins/limit-count/sliding-window/
+
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/limit-count/sliding-window/store
+	$(ENV_INSTALL) apisix/plugins/limit-count/sliding-window/store/*.lua $(ENV_INST_LUADIR)/apisix/plugins/limit-count/sliding-window/store/
 
 	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/opa
 	$(ENV_INSTALL) apisix/plugins/opa/*.lua $(ENV_INST_LUADIR)/apisix/plugins/opa/
@@ -377,19 +387,39 @@ install: runtime
 	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/ai-proxy
 	$(ENV_INSTALL) apisix/plugins/ai-proxy/*.lua $(ENV_INST_LUADIR)/apisix/plugins/ai-proxy
 
-	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/ai-drivers
-	$(ENV_INSTALL) apisix/plugins/ai-drivers/*.lua $(ENV_INST_LUADIR)/apisix/plugins/ai-drivers
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/ai-providers
+	$(ENV_INSTALL) apisix/plugins/ai-providers/*.lua $(ENV_INST_LUADIR)/apisix/plugins/ai-providers
+
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/ai-protocols
+	$(ENV_INSTALL) apisix/plugins/ai-protocols/*.lua $(ENV_INST_LUADIR)/apisix/plugins/ai-protocols
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/ai-protocols/converters
+	$(ENV_INSTALL) apisix/plugins/ai-protocols/converters/*.lua $(ENV_INST_LUADIR)/apisix/plugins/ai-protocols/converters
+
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/ai-transport
+	$(ENV_INSTALL) apisix/plugins/ai-transport/*.lua $(ENV_INST_LUADIR)/apisix/plugins/ai-transport
 
 	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/ai-rag/embeddings
 	$(ENV_INSTALL) apisix/plugins/ai-rag/embeddings/*.lua $(ENV_INST_LUADIR)/apisix/plugins/ai-rag/embeddings
 	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/ai-rag/vector-search
 	$(ENV_INSTALL) apisix/plugins/ai-rag/vector-search/*.lua $(ENV_INST_LUADIR)/apisix/plugins/ai-rag/vector-search
 
-	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/mcp/broker
-	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/mcp/transport
-	$(ENV_INSTALL) apisix/plugins/mcp/*.lua $(ENV_INST_LUADIR)/apisix/plugins/mcp
-	$(ENV_INSTALL) apisix/plugins/mcp/broker/*.lua $(ENV_INST_LUADIR)/apisix/plugins/mcp/broker
-	$(ENV_INSTALL) apisix/plugins/mcp/transport/*.lua $(ENV_INST_LUADIR)/apisix/plugins/mcp/transport
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/ai-cache
+	$(ENV_INSTALL) apisix/plugins/ai-cache/*.lua $(ENV_INST_LUADIR)/apisix/plugins/ai-cache
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/ai-cache/embeddings
+	$(ENV_INSTALL) apisix/plugins/ai-cache/embeddings/*.lua $(ENV_INST_LUADIR)/apisix/plugins/ai-cache/embeddings
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/ai-cache/vector-search
+	$(ENV_INSTALL) apisix/plugins/ai-cache/vector-search/*.lua $(ENV_INST_LUADIR)/apisix/plugins/ai-cache/vector-search
+
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/ai-lakera-guard
+	$(ENV_INSTALL) apisix/plugins/ai-lakera-guard/*.lua $(ENV_INST_LUADIR)/apisix/plugins/ai-lakera-guard
+
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/openapi-to-mcp/openapi
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/openapi-to-mcp/tools
+	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/openapi-to-mcp/transport
+	$(ENV_INSTALL) apisix/plugins/openapi-to-mcp/*.lua $(ENV_INST_LUADIR)/apisix/plugins/openapi-to-mcp
+	$(ENV_INSTALL) apisix/plugins/openapi-to-mcp/openapi/*.lua $(ENV_INST_LUADIR)/apisix/plugins/openapi-to-mcp/openapi
+	$(ENV_INSTALL) apisix/plugins/openapi-to-mcp/tools/*.lua $(ENV_INST_LUADIR)/apisix/plugins/openapi-to-mcp/tools
+	$(ENV_INSTALL) apisix/plugins/openapi-to-mcp/transport/*.lua $(ENV_INST_LUADIR)/apisix/plugins/openapi-to-mcp/transport
 
 	$(ENV_INSTALL) -d $(ENV_INST_LUADIR)/apisix/plugins/jwt-auth
 	$(ENV_INSTALL) apisix/plugins/jwt-auth/*.lua $(ENV_INST_LUADIR)/apisix/plugins/jwt-auth

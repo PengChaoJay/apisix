@@ -16,7 +16,6 @@
 --
 local core     = require("apisix.core")
 local log_util = require("apisix.utils.log-util")
-local plugin   = require("apisix.plugin")
 local bp_manager_mod = require("apisix.utils.batch-processor-manager")
 local plugin_name = "tcp-logger"
 local tostring = tostring
@@ -24,7 +23,7 @@ local ngx = ngx
 local tcp = ngx.socket.tcp
 
 
-local batch_processor_manager = bp_manager_mod.new("tcp logger")
+local batch_processor_manager = bp_manager_mod.new("tcp logger", plugin_name)
 local schema = {
     type = "object",
     properties = {
@@ -34,6 +33,7 @@ local schema = {
         tls_options = {type = "string"},
         timeout = {type = "integer", minimum = 1, default= 1000},
         log_format = {type = "object"},
+        log_format_extra = {type = "object"},
         include_req_body = {type = "boolean", default = false},
         include_req_body_expr = {
             type = "array",
@@ -50,6 +50,8 @@ local schema = {
                 type = "array"
             }
         },
+        max_req_body_bytes = {type = "integer", minimum = 1, default = 524288},
+        max_resp_body_bytes = {type = "integer", minimum = 1, default = 524288},
     },
     required = {"host", "port"}
 }
@@ -57,13 +59,11 @@ local schema = {
 local metadata_schema = {
     type = "object",
     properties = {
-        log_format = {
+        log_format_extra = {
             type = "object"
         },
-        max_pending_entries = {
-            type = "integer",
-            description = "maximum number of pending entries in the batch processor",
-            minimum = 1,
+        log_format = {
+            type = "object"
         },
     },
 }
@@ -72,7 +72,7 @@ local _M = {
     version = 0.1,
     priority = 405,
     name = plugin_name,
-    metadata_schema = metadata_schema,
+    metadata_schema = batch_processor_manager:wrap_metadata_schema(metadata_schema),
     schema = batch_processor_manager:wrap_schema(schema),
 }
 
@@ -99,7 +99,6 @@ local function send_tcp_data(conf, log_message)
     sock:settimeout(conf.timeout)
 
     core.log.info("sending a batch logs to ", conf.host, ":", conf.port)
-    core.log.info("sending log_message: ", log_message)
 
     local ok, err = sock:connect(conf.host, conf.port)
     if not ok then
@@ -132,18 +131,18 @@ local function send_tcp_data(conf, log_message)
 end
 
 
+_M.access = log_util.check_and_read_req_body
+
+
 function _M.body_filter(conf, ctx)
     log_util.collect_body(conf, ctx)
 end
 
 
 function _M.log(conf, ctx)
-    local metadata = plugin.plugin_metadata(plugin_name)
-    local max_pending_entries = metadata and metadata.value and
-                                metadata.value.max_pending_entries or nil
     local entry = log_util.get_log_entry(plugin_name, conf, ctx)
 
-    if batch_processor_manager:add_entry(conf, entry, max_pending_entries) then
+    if batch_processor_manager:add_entry(conf, entry) then
         return
     end
 
@@ -163,7 +162,7 @@ function _M.log(conf, ctx)
         return send_tcp_data(conf, data)
     end
 
-    batch_processor_manager:add_entry_to_new_processor(conf, entry, ctx, func, max_pending_entries)
+    batch_processor_manager:add_entry_to_new_processor(conf, entry, ctx, func)
 end
 
 

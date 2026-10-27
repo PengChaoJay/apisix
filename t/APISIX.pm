@@ -207,6 +207,7 @@ $grpc_location .= <<_EOC_;
             grpc_set_header   Content-Type application/grpc;
             grpc_set_header   TE trailers;
             grpc_socket_keepalive on;
+            grpc_ssl_name     \$upstream_host;
             grpc_pass         \$upstream_scheme://apisix_backend;
             mirror              /proxy_mirror_grpc;
 
@@ -220,6 +221,52 @@ $grpc_location .= <<_EOC_;
 
             log_by_lua_block {
                 apisix.http_log_phase()
+            }
+        }
+_EOC_
+
+my $disable_proxy_buffering_location = <<_EOC_;
+        location \@disable_proxy_buffering {
+            access_by_lua_block {
+                apisix.disable_proxy_buffering_access_phase()
+            }
+
+            proxy_http_version 1.1;
+            proxy_set_header   Host              \$upstream_host;
+            proxy_set_header   Upgrade           \$upstream_upgrade;
+            proxy_set_header   Connection        \$upstream_connection;
+            proxy_set_header   X-Real-IP         \$remote_addr;
+            proxy_pass_header  Date;
+
+            proxy_set_header   X-Forwarded-For      \$proxy_add_x_forwarded_for;
+
+            proxy_pass         \$upstream_scheme://apisix_backend\$upstream_uri;
+            mirror             /proxy_mirror;
+
+            header_filter_by_lua_block {
+                apisix.http_header_filter_phase()
+            }
+
+            body_filter_by_lua_block {
+                apisix.http_body_filter_phase()
+            }
+
+            log_by_lua_block {
+                apisix.http_log_phase()
+            }
+
+            proxy_buffering off;
+        }
+_EOC_
+
+my $websocket_location = <<_EOC_;
+        location \@websocket_pass {
+            content_by_lua_block {
+                apisix.websocket_content_phase()
+            }
+
+            log_by_lua_block {
+                apisix.websocket_log_phase()
             }
         }
 _EOC_
@@ -238,6 +285,7 @@ if ($version =~ m/\/apisix-nginx-module/) {
     $a6_ngx_vars = <<_EOC_;
     set \$wasm_process_req_body       '';
     set \$wasm_process_resp_body      '';
+    set \$rate_limiting_info          '';
 _EOC_
 }
 
@@ -292,8 +340,10 @@ lua {
     lua_shared_dict prometheus-metrics 15m;
     lua_shared_dict prometheus-cache 10m;
     lua_shared_dict standalone-config 10m;
+    lua_shared_dict standalone-status 1m;
     lua_shared_dict status-report 1m;
     lua_shared_dict nacos 10m;
+    lua_shared_dict consul 10m;
     lua_shared_dict upstream-healthcheck 10m;
 }
 _EOC_
@@ -315,6 +365,9 @@ _EOC_
         if ($block->stream_sni) {
             $sni = '"' . $block->stream_sni . '"';
         }
+
+        # a bare `--- stream_tls_verify` section has an empty, false value
+        my $tls_verify = defined $block->stream_tls_verify ? "true" : "false";
         chomp $stream_tls_request;
 
         my $repeat = "1";
@@ -334,7 +387,7 @@ _EOC_
                             return
                         end
 
-                        sess, err = sock:sslhandshake(sess, $sni, false)
+                        sess, err = sock:sslhandshake(sess, $sni, $tls_verify)
                         if not sess then
                             ngx.say("failed to do SSL handshake: ", err)
                             return
@@ -409,9 +462,15 @@ _EOC_
             ngx.say("hello world")
 _EOC_
 
+    # backs apisix_stream_active_connections and apisix_stream_bandwidth
+    my $stream_metrics_zone = $version =~ m/\/apisix-nginx-module/
+                              ? "apisix_stream_metrics_zone 1m;" : "";
+
     my $stream_config = $block->stream_config // <<_EOC_;
     $lua_deps_path
     lua_socket_log_errors off;
+
+    $stream_metrics_zone
 
     lua_shared_dict lrucache-lock-stream 10m;
     lua_shared_dict plugin-limit-conn-stream 10m;
@@ -421,6 +480,8 @@ _EOC_
     lua_shared_dict kubernetes-stream 1m;
     lua_shared_dict kubernetes-first-stream 1m;
     lua_shared_dict kubernetes-second-stream 1m;
+    lua_shared_dict nacos-stream 10m;
+    lua_shared_dict consul-stream 10m;
     lua_shared_dict tars-stream 1m;
 
     upstream apisix_backend {
@@ -545,6 +606,10 @@ $stream_config
     }
 }
 _EOC_
+        # the stream block lives in the main config here, so drop the block values
+        # or Test::Nginx renders a second, conflicting one
+        $block->set_value("stream_config");
+        $block->set_value("stream_server_config");
     }
 
     $block->set_value("main_config", $main_config);
@@ -585,15 +650,30 @@ _EOC_
     $http_config .= <<_EOC_;
     $lua_deps_path
 
+    # mirrors apisix/cli/ngx_tpl.lua
+    map \$http_host \$var_x_forwarded_port {
+        default          \$server_port;
+        "~:(?<p>\\\\d+)\$" \$p;
+    }
+    map \$http_host \$var_x_forwarded_host {
+        default \$http_host;
+        ""      \$host;
+    }
+
     lua_shared_dict plugin-limit-req 10m;
     lua_shared_dict plugin-limit-count 10m;
+    lua_shared_dict plugin-limit-count-lock 10m;
     lua_shared_dict plugin-limit-count-reset-header 10m;
     lua_shared_dict plugin-limit-conn 10m;
     lua_shared_dict plugin-ai-rate-limiting 10m;
     lua_shared_dict plugin-ai-rate-limiting-reset-header 10m;
+    lua_shared_dict plugin-graphql-limit-count 10m;
+    lua_shared_dict plugin-graphql-limit-count-reset-header 10m;
+    lua_shared_dict plugin-saml-auth-replay 10m;
     lua_shared_dict internal-status 10m;
     lua_shared_dict worker-events 10m;
     lua_shared_dict lrucache-lock 10m;
+    lua_shared_dict upstream-slow-start 10m;
     lua_shared_dict balancer-ewma 1m;
     lua_shared_dict balancer-ewma-locks 1m;
     lua_shared_dict balancer-ewma-last-touched-at 1m;
@@ -674,7 +754,7 @@ _EOC_
         require("apisix").http_exit_worker()
     }
 
-    log_format main escape=default '\$remote_addr - \$remote_user [\$time_local] \$http_host "\$request" \$status \$body_bytes_sent \$request_time "\$http_referer" "\$http_user_agent" \$upstream_addr \$upstream_status \$apisix_upstream_response_time "\$upstream_scheme://\$upstream_host\$upstream_uri" \$request_llm_model \$llm_model \$llm_time_to_first_token \$llm_prompt_tokens \$llm_completion_tokens';
+    log_format main escape=default '\$remote_addr - \$remote_user [\$time_local] \$http_host "\$request_line" \$status \$body_bytes_sent \$request_time "\$http_referer" "\$http_user_agent" \$upstream_addr \$upstream_status \$apisix_upstream_response_time "\$upstream_scheme://\$upstream_host\$upstream_uri" \$request_llm_model \$llm_model \$llm_time_to_first_token \$llm_prompt_tokens \$llm_completion_tokens \$llm_total_tokens \$llm_stream \$llm_has_tool_calls \$llm_tool_count \$llm_end_user_id \$llm_cache_read_input_tokens \$llm_cache_creation_input_tokens \$llm_reasoning_tokens "\$rate_limiting_info" unresolved_host=\$upstream_unresolved_host';
 
     # fake server, only for test
     server {
@@ -706,6 +786,20 @@ _EOC_
             }
 
             more_clear_headers Date;
+        }
+    }
+
+    # accepts a connection on any path but never writes a response, so a
+    # client waiting on it reliably times out instead of being refused or
+    # having to depend on an unroutable address actually hanging
+    server {
+        listen 1986;
+        server_tokens off;
+
+        location / {
+            content_by_lua_block {
+                ngx.sleep(30)
+            }
         }
     }
 
@@ -776,6 +870,22 @@ _EOC_
         $ipv6_listen_conf = "listen \[::1\]:1984;"
     }
 
+    my $enable_test_control_api_v1 =
+        !defined($ENV{TEST_ENABLE_CONTROL_API_V1}) ||
+        $ENV{TEST_ENABLE_CONTROL_API_V1} ne "0";
+
+    my $control_api_v1_location = "";
+    if ($enable_test_control_api_v1) {
+        $control_api_v1_location = <<_EOC_;
+        location /v1/ {
+            content_by_lua_block {
+                apisix.http_control()
+            }
+        }
+
+_EOC_
+    }
+
     my $config = $block->config // '';
     $config .= <<_EOC_;
         $ipv6_listen_conf
@@ -818,27 +928,27 @@ _EOC_
             set \$upstream_scheme             'http';
             set \$upstream_host               \$http_host;
             set \$upstream_uri                '';
+            set \$request_line                '';
 
             content_by_lua_block {
                 apisix.http_admin()
             }
         }
 
-        location /v1/ {
-            content_by_lua_block {
-                apisix.http_control()
-            }
-        }
+        $control_api_v1_location
 
         location / {
             set \$upstream_mirror_host        '';
             set \$upstream_mirror_uri         '';
+            set \$upstream_mirror_grpc_path   '';
             set \$upstream_upgrade            '';
             set \$upstream_connection         '';
 
             set \$upstream_scheme             'http';
             set \$upstream_host               \$http_host;
+            set \$upstream_unresolved_host    '';
             set \$upstream_uri                '';
+            set \$request_line                '';
             set \$ctx_ref                     '';
 
             set \$upstream_cache_zone            off;
@@ -865,6 +975,14 @@ _EOC_
             set \$llm_model                      '';
             set \$llm_prompt_tokens              '0';
             set \$llm_completion_tokens          '0';
+            set \$llm_total_tokens               '0';
+            set \$llm_stream                     'false';
+            set \$llm_has_tool_calls             'false';
+            set \$llm_tool_count                 '0';
+            set \$llm_end_user_id                '';
+            set \$llm_cache_read_input_tokens    '0';
+            set \$llm_cache_creation_input_tokens '0';
+            set \$llm_reasoning_tokens           '0';
 
             set \$apisix_upstream_response_time  \$upstream_response_time;
             access_log $apisix_home/t/servroot/logs/access.log main;
@@ -885,16 +1003,19 @@ _EOC_
             proxy_set_header   X-Real-IP         \$remote_addr;
             proxy_pass_header  Date;
 
+            set \$original_x_forwarded_proto \$http_x_forwarded_proto;
+            set \$original_x_forwarded_host   \$http_x_forwarded_host;
+            set \$original_x_forwarded_port   \$http_x_forwarded_port;
+            set \$original_x_forwarded_for    '';
+            set \$original_forwarded          \$http_forwarded;
+            more_set_input_headers "X-Forwarded-Proto: \$scheme";
+            more_set_input_headers "X-Forwarded-Host: \$var_x_forwarded_host";
+            more_set_input_headers "X-Forwarded-Port: \$var_x_forwarded_port";
+            more_set_input_headers "Forwarded: ";
+
             ### the following x-forwarded-* headers is to send to upstream server
 
-            set \$var_x_forwarded_proto      \$scheme;
-            set \$var_x_forwarded_host       \$host;
-            set \$var_x_forwarded_port       \$server_port;
-
             proxy_set_header   X-Forwarded-For      \$proxy_add_x_forwarded_for;
-            proxy_set_header   X-Forwarded-Proto    \$var_x_forwarded_proto;
-            proxy_set_header   X-Forwarded-Host     \$var_x_forwarded_host;
-            proxy_set_header   X-Forwarded-Port     \$var_x_forwarded_port;
 
             proxy_pass         \$upstream_scheme://apisix_backend\$upstream_uri;
             mirror             /proxy_mirror;
@@ -914,6 +1035,8 @@ _EOC_
 
         $grpc_location
         $dubbo_location
+        $disable_proxy_buffering_location
+        $websocket_location
 
         location = /proxy_mirror {
             internal;
@@ -946,6 +1069,7 @@ _EOC_
     }
 
     $config .= <<_EOC_;
+            rewrite ^ \$upstream_mirror_grpc_path break;
             grpc_pass \$upstream_mirror_host;
         }
 _EOC_

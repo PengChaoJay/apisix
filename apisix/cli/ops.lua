@@ -54,6 +54,127 @@ local str_format = string.format
 local _M = {}
 
 
+-- Validate a port number or port range string.
+-- Accepts: integer, "port", "start-end", "addr:port", "addr:start-end",
+--          "[ipv6]:port", "[ipv6]:start-end"
+-- Returns true on success, or nil + error message.
+local function validate_port_or_range(port_entry)
+    local entry_type = type(port_entry)
+    if entry_type ~= "string" and entry_type ~= "number" then
+        return nil, "invalid port value type: " .. entry_type
+    end
+
+    -- For number type, require integer in valid port range
+    if entry_type == "number" then
+        if floor(port_entry) ~= port_entry then
+            return nil, "port must be an integer, got: " .. tostring(port_entry)
+        end
+        if port_entry < 1 or port_entry > 65535 then
+            return nil, "port out of range (1-65535): " .. tostring(port_entry)
+        end
+        return true
+    end
+
+    local addr_str = port_entry
+
+    -- Extract the port part (after last colon for addr:port, or the whole string)
+    local port_part
+    if str_find(addr_str, "[", 1, true) then
+        -- IPv6: [::1]:port or [::1]:start-end
+        local bracket_end = str_find(addr_str, "]", 1, true)
+        if bracket_end and str_sub(addr_str, bracket_end + 1, bracket_end + 1) == ":" then
+            port_part = str_sub(addr_str, bracket_end + 2)
+        else
+            return true  -- let nginx validate complex IPv6 formats
+        end
+    elseif str_find(addr_str, ":", 1, true) then
+        -- IPv4 addr:port or addr:start-end
+        local colon_pos = str_find(addr_str, ":", 1, true)
+        port_part = str_sub(addr_str, colon_pos + 1)
+    else
+        port_part = addr_str
+    end
+
+    -- Check if port_part is a range (start-end), only when both sides are digits
+    local start_str, end_str = port_part:match("^(%d+)%-(%d+)$")
+    if start_str then
+        local start_port = tonumber(start_str)
+        local end_port = tonumber(end_str)
+        if start_port < 1 or start_port > 65535 then
+            return nil, "port out of range (1-65535): " .. start_str
+        end
+        if end_port < 1 or end_port > 65535 then
+            return nil, "port out of range (1-65535): " .. end_str
+        end
+        if start_port > end_port then
+            return nil, "invalid port range (start > end): " .. addr_str
+        end
+    else
+        if port_part == "" then
+            return nil, "missing port: " .. addr_str
+        end
+
+        if port_part:match("^%d+$") then
+            local port = tonumber(port_part)
+            if port < 1 or port > 65535 then
+                return nil, "port out of range (1-65535): " .. port_part
+            end
+        elseif port_part:match("^%d") then
+            -- Starts with digit but not a pure integer or valid range — reject
+            -- (catches "80.5", "1e3", etc.)
+            return nil, "invalid port format: " .. addr_str
+        end
+        -- Non-digit-starting port_part (e.g., unix socket) - let nginx validate
+    end
+
+    return true
+end
+
+
+-- Split a stream_proxy.tcp `addr` into its address and port range. Returns nil for
+-- the forms validate_port_or_range leaves to nginx.
+local function parse_listen_addr(addr)
+    if type(addr) == "number" then
+        return "", addr, addr
+    end
+
+    local ip, port_part
+    if str_find(addr, "[", 1, true) then
+        local bracket_end = str_find(addr, "]", 1, true)
+        if not (bracket_end and str_sub(addr, bracket_end + 1, bracket_end + 1) == ":") then
+            return nil
+        end
+        ip = str_sub(addr, 1, bracket_end)
+        port_part = str_sub(addr, bracket_end + 2)
+    else
+        local colon_pos = str_find(addr, ":", 1, true)
+        if colon_pos then
+            ip = str_sub(addr, 1, colon_pos - 1)
+            port_part = str_sub(addr, colon_pos + 1)
+        else
+            ip = ""
+            port_part = addr
+        end
+    end
+
+    if ip == "0.0.0.0" then
+        ip = ""
+    end
+
+    local start_str, end_str = port_part:match("^(%d+)%-(%d+)$")
+    if start_str then
+        return ip, tonumber(start_str), tonumber(end_str)
+    end
+
+    local port = tonumber(port_part)
+    if not port then
+        return nil
+    end
+
+    return ip, port, port
+end
+
+
 local function help()
     print([[
 Usage: apisix [action] <argument>
@@ -211,8 +332,10 @@ local function init(env)
        and #allow_admin == 1 and allow_admin[1] == "127.0.0.0/24" then
         checked_admin_key = true
     end
-    -- check if admin_key is required
-    if yaml_conf.deployment.admin.admin_key_required == false then
+    -- check if admin_key is required; deployment.admin is guarded above and below
+    -- because `admin:` written as YAML null makes merge_conf drop it
+    if yaml_conf.deployment.admin
+       and yaml_conf.deployment.admin.admin_key_required == false then
         checked_admin_key = true
         print("Warning! Admin key is bypassed! "
                 .. "If you are deploying APISIX in a production environment, "
@@ -528,19 +651,142 @@ Please modify "admin_key" in conf/config.yaml .
     yaml_conf.apisix.ssl.ssl_cert = "cert/ssl_PLACE_HOLDER.crt"
     yaml_conf.apisix.ssl.ssl_cert_key = "cert/ssl_PLACE_HOLDER.key"
 
-    local tcp_enable_ssl
     -- compatible with the original style which only has the addr
     if enable_stream and yaml_conf.apisix.stream_proxy and yaml_conf.apisix.stream_proxy.tcp then
         local tcp = yaml_conf.apisix.stream_proxy.tcp
-        for i, item in ipairs(tcp) do
-            if type(item) ~= "table" then
-                tcp[i] = {addr = item}
+        local normalized_tcp = {}
+        for _, item in ipairs(tcp) do
+            if type(item) == "table" then
+                local ok, verr = validate_port_or_range(item.addr)
+                if not ok then
+                    util.die("invalid stream_proxy.tcp entry: ", verr, "\n")
+                end
+                table_insert(normalized_tcp, item)
             else
-                if item.tls then
-                    tcp_enable_ssl = true
+                local ok, verr = validate_port_or_range(item)
+                if not ok then
+                    util.die("invalid stream_proxy.tcp entry: ", verr, "\n")
+                end
+                table_insert(normalized_tcp, {addr = item})
+            end
+        end
+        yaml_conf.apisix.stream_proxy.tcp = normalized_tcp
+    end
+
+    if enable_stream and yaml_conf.apisix.stream_proxy and yaml_conf.apisix.stream_proxy.udp then
+        local udp = yaml_conf.apisix.stream_proxy.udp
+        for _, item in ipairs(udp) do
+            local ok, verr = validate_port_or_range(item)
+            if not ok then
+                util.die("invalid stream_proxy.udp entry: ", verr, "\n")
+            end
+        end
+    end
+
+    -- Split stream listens into nginx server blocks, one per combination of the
+    -- server-level directives a listen needs: `proxy_protocol on` (PROXY protocol to
+    -- the upstream) and the TLS mode -- plain (`listen ... [ssl]`), passthrough
+    -- (`ssl_preread on`) or mixed (`ssl_preread on` plus the two internal servers the
+    -- route picks between). The accept-side `proxy_protocol` and `ssl` are per-listen
+    -- and coexist in one block. Per-listen settings fall back to the global
+    -- `proxy_protocol` options; UDP always joins the plain block.
+    if enable_stream and yaml_conf.apisix.stream_proxy then
+        local stream_proxy = yaml_conf.apisix.stream_proxy
+        local pp = yaml_conf.apisix.proxy_protocol or {}
+        local plain = {
+            tcp = {}, udp = stream_proxy.udp or {},
+            proxy_protocol_to_upstream = false, tcp_enable_ssl = false,
+            tls_passthrough = false, tls_mixed = false,
+        }
+        local servers = {plain}
+        local group_by_key = {["false|plain"] = plain}
+        for _, item in ipairs(stream_proxy.tcp or {}) do
+            if item.proxy_protocol == nil then
+                item.proxy_protocol = pp.enable_tcp_pp
+            end
+            local up = item.proxy_protocol_to_upstream
+            if up == nil then
+                up = pp.enable_tcp_pp_to_upstream
+            end
+            up = up and true or false
+            local mode = "plain"
+            if item.tls_passthrough then
+                mode = item.tls and "mixed" or "passthrough"
+            end
+            if mode == "mixed" and up then
+                -- The mixed block reaches its internal servers over a unix socket,
+                -- and nginx builds the upstream PROXY protocol header from that
+                -- socket: the destination comes out as `unix:/... 0`, which is not
+                -- a valid TCP4/TCP6 address and strict backends reject it. A
+                -- dedicated tls or tls_passthrough listen has no internal hop and
+                -- writes a correct header.
+                util.die("invalid stream_proxy.tcp entry: `", tostring(item.addr),
+                         "` can not combine proxy_protocol_to_upstream with a mixed ",
+                         "`tls` + `tls_passthrough` listen; use a dedicated listen ",
+                         "for either mode\n")
+            end
+
+            local key = tostring(up) .. "|" .. mode
+            local group = group_by_key[key]
+            if not group then
+                group = {
+                    tcp = {}, udp = {},
+                    proxy_protocol_to_upstream = up, tcp_enable_ssl = false,
+                    tls_passthrough = mode ~= "plain", tls_mixed = mode == "mixed",
+                }
+                group_by_key[key] = group
+                table_insert(servers, group)
+            end
+            -- in mixed mode the internal server terminates, so the listen stays plain
+            if item.tls and mode == "plain" then
+                group.tcp_enable_ssl = true
+            end
+            table_insert(group.tcp, item)
+        end
+        if #plain.tcp == 0 and #plain.udp == 0 then
+            table_remove(servers, 1)
+        end
+        -- Two listens needing different server blocks can not share an address: nginx
+        -- refuses to start with reuseport on, and silently keeps only the first without.
+        local addr_owner = {}
+        for idx, group in ipairs(servers) do
+            for _, item in ipairs(group.tcp) do
+                local ip, first, last = parse_listen_addr(item.addr)
+                if ip then
+                    for port = first, last do
+                        local key = ip .. "|" .. port
+                        if addr_owner[key] and addr_owner[key] ~= idx then
+                            util.die("invalid stream_proxy.tcp entry: `", tostring(item.addr),
+                                     "` collides with an earlier entry on the same address ",
+                                     "that needs a different nginx server block; one address ",
+                                     "can only have one TLS mode and one ",
+                                     "proxy_protocol_to_upstream setting\n")
+                        end
+                        addr_owner[key] = idx
+                    end
                 end
             end
         end
+
+        -- Short names on purpose: the kernel caps a unix socket path at ~108 bytes and
+        -- it is rooted at the user-chosen apisix home.
+        for idx, group in ipairs(servers) do
+            if group.tls_mixed then
+                group.tls_terminate_sock = env.apisix_home .. "/logs/stls-t" .. idx .. ".sock"
+                group.tls_passthrough_sock = env.apisix_home .. "/logs/stls-p" .. idx .. ".sock"
+                group.tls_terminate_up = "apisix_stream_tls_terminate_" .. idx
+                group.tls_passthrough_up = "apisix_stream_tls_passthrough_" .. idx
+                for _, path in ipairs({group.tls_terminate_sock, group.tls_passthrough_sock}) do
+                    if #path > 100 then
+                        util.die("mixed TLS listens need internal unix sockets under ",
+                                 env.apisix_home, "/logs, but `", path, "` is ", #path,
+                                 " bytes, over the ~108 byte limit; install APISIX ",
+                                 "under a shorter path\n")
+                    end
+                end
+            end
+        end
+        stream_proxy.servers = servers
     end
 
     local dubbo_upstream_multiplex_count = 32
@@ -593,7 +839,6 @@ Please modify "admin_key" in conf/config.yaml .
         enabled_stream_plugins = enabled_stream_plugins,
         dubbo_upstream_multiplex_count = dubbo_upstream_multiplex_count,
         status_server_addr = status_server_addr,
-        tcp_enable_ssl = tcp_enable_ssl,
         admin_server_addr = admin_server_addr,
         control_server_addr = control_server_addr,
         prometheus_server_addr = prometheus_server_addr,
@@ -767,6 +1012,33 @@ Please modify "admin_key" in conf/config.yaml .
 
     end
 
+    -- inject consul discovery shared dict
+    if enabled_discoveries["consul"] then
+        if not sys_conf["discovery_shared_dicts"] then
+            sys_conf["discovery_shared_dicts"] = {}
+        end
+
+        local consul_conf = yaml_conf.discovery["consul"]
+        sys_conf["discovery_shared_dicts"]["consul"] = consul_conf.shared_size or "64m"
+    end
+
+    -- env entries are rendered as double-quoted nginx directive parameters
+    -- (`env "{*name*}";` in ngx_tpl.lua), so embedded `\` and `"` must be
+    -- escaped; nginx unescapes them when reading the quoted token
+    -- entries synthesized after schema validation (kubernetes discovery copies
+    -- whatever sits between `${` and `}`) never went through the schema
+    -- pattern, so re-check them here rather than emitting a conf that nginx
+    -- rejects with an error pointing at a line the user never wrote
+    if sys_conf["envs"] then
+        for i, cfg_env in ipairs(sys_conf["envs"]) do
+            if cfg_env:find("%c") then
+                util.die("invalid environment variable entry: ",
+                         "control characters are not allowed\n")
+            end
+            sys_conf["envs"][i] = cfg_env:gsub('[\\"]', '\\%0')
+        end
+    end
+
     -- fix up lua path
     sys_conf["extra_lua_path"] = get_lua_path(yaml_conf.apisix.extra_lua_path)
     sys_conf["extra_lua_cpath"] = get_lua_path(yaml_conf.apisix.extra_lua_cpath)
@@ -907,7 +1179,10 @@ local function start(env, ...)
         init_etcd(env, args)
     end
 
-    util.execute_cmd(env.openresty_args)
+    -- Don't capture openresty's stdout: a log file configured as /dev/stdout
+    -- would be opened on the capture pipe and kept by the daemonized workers,
+    -- so the read would never see EOF and would buffer every log line.
+    execute(env.openresty_args)
 end
 
 

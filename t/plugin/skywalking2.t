@@ -65,9 +65,8 @@ _EOC_
             end
         end
 
-        if 0 == ngx.worker.id() then
-            -- patch: skywalking2
-            -- Ensure that it is executed only once
+        -- patch: skywalking2
+        if metadata_buffer:add("backend_timer_started", true) then
             ngx.log(ngx.INFO, "start skywalking backend timer")
             local ok, err = new_timer(self.backendTimerDelay, check)
             if not ok then
@@ -149,8 +148,7 @@ passed
             local http = require "resty.http"
             local uri = "http://127.0.0.1:" .. ngx.var.server_port
                         .. "/opentracing"
-            local ports_count = {}
-            for i = 1, 12 do
+            for i = 1, 50 do
                 local httpc = http.new()
                 local res, err = httpc:request_uri(uri, {method = "GET", keepalive = false})
                 if not res then
@@ -170,6 +168,7 @@ passed
 GET /t
 --- response_body
 passed
+--- timeout: 10
 --- grep_error_log eval
 qr/start skywalking backend timer/
 --- grep_error_log_out

@@ -14,10 +14,9 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 --
-local core  = require("apisix.core")
+local core      = require("apisix.core")
+local protocols = require("apisix.plugins.ai-protocols")
 local ngx   = ngx
-local pairs = pairs
-local EMPTY = {}
 
 local prompt_schema = {
     properties = {
@@ -41,6 +40,13 @@ local prompts = {
 local schema = {
     type = "object",
     properties = {
+        max_req_body_size = {
+            type = "integer",
+            minimum = 1,
+            default = 67108864,
+            description = "maximum request body size in bytes buffered into "
+                       .. "memory; larger request bodies are rejected",
+        },
         prepend = prompts,
         append = prompts,
     },
@@ -65,52 +71,29 @@ function _M.check_schema(conf)
 end
 
 
-local function get_request_body_table()
-    local body, err = core.request.get_body()
+local function get_request_body_table(max_size)
+    local body, err = core.request.get_body(max_size)
     if not body then
-        return nil, { message = "could not get body: " .. err }
+        return nil, { message = "could not get body: " .. (err or "request body is empty") }
     end
 
     local body_tab, err = core.json.decode(body)
     if not body_tab then
-        return nil, { message = "could not get parse JSON request body: " .. err }
+        return nil, { message = "could not parse JSON request body: " .. (err or "invalid JSON") }
     end
 
     return body_tab
 end
 
 
-local function decorate(conf, body_tab)
-    local new_messages = {}
-
-    if conf.prepend then
-        for i = 1, #conf.prepend do
-            new_messages[i] = conf.prepend[i]
-        end
-    end
-
-    for _, message in pairs(body_tab.messages) do
-        core.table.insert_tail(new_messages, message)
-    end
-
-    for _, message in pairs(conf.append or EMPTY) do
-        core.table.insert_tail(new_messages, message)
-    end
-
-    body_tab.messages = new_messages
-end
-
-
 function _M.rewrite(conf, ctx)
-    local body_tab, err = get_request_body_table()
+    local body_tab, err = get_request_body_table(conf.max_req_body_size)
     if not body_tab then
         return 400, err
     end
 
-    if not body_tab.messages then
-        return 400, "messages missing from request body"
-    end
-    decorate(conf, body_tab) -- will decorate body_tab in place
+    protocols.prepend_messages(body_tab, ctx, conf.prepend)
+    protocols.append_messages(body_tab, ctx, conf.append)
 
     local new_jbody, err = core.json.encode(body_tab)
     if not new_jbody then

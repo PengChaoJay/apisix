@@ -14,9 +14,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 --
-
 local bp_manager_mod  = require("apisix.utils.batch-processor-manager")
-local plugin          = require("apisix.plugin")
 local log_util        = require("apisix.utils.log-util")
 local core            = require("apisix.core")
 local http            = require("resty.http")
@@ -26,7 +24,7 @@ local tostring = tostring
 local ipairs   = ipairs
 
 local plugin_name = "http-logger"
-local batch_processor_manager = bp_manager_mod.new("http logger")
+local batch_processor_manager = bp_manager_mod.new("http logger", plugin_name)
 
 local schema = {
     type = "object",
@@ -35,6 +33,7 @@ local schema = {
         auth_header = {type = "string"},
         timeout = {type = "integer", minimum = 1, default = 3},
         log_format = {type = "object"},
+        log_format_extra = {type = "object"},
         include_req_body = {type = "boolean", default = false},
         include_req_body_expr = {
             type = "array",
@@ -51,10 +50,13 @@ local schema = {
                 type = "array"
             }
         },
+        max_req_body_bytes = {type = "integer", minimum = 1, default = 524288},
+        max_resp_body_bytes = {type = "integer", minimum = 1, default = 524288},
         concat_method = {type = "string", default = "json",
                          enum = {"json", "new_line"}},
         ssl_verify = {type = "boolean", default = false},
     },
+    encrypt_fields = {"auth_header"},
     required = {"uri"}
 }
 
@@ -62,13 +64,11 @@ local schema = {
 local metadata_schema = {
     type = "object",
     properties = {
-        log_format = {
+        log_format_extra = {
             type = "object"
         },
-        max_pending_entries = {
-            type = "integer",
-            description = "maximum number of pending entries in the batch processor",
-            minimum = 1,
+        log_format = {
+            type = "object"
         },
     },
 }
@@ -79,7 +79,7 @@ local _M = {
     priority = 410,
     name = plugin_name,
     schema = batch_processor_manager:wrap_schema(schema),
-    metadata_schema = metadata_schema,
+    metadata_schema = batch_processor_manager:wrap_metadata_schema(metadata_schema),
 }
 
 
@@ -168,22 +168,22 @@ local function send_http_data(conf, log_message)
 end
 
 
+_M.access = log_util.check_and_read_req_body
+
+
 function _M.body_filter(conf, ctx)
     log_util.collect_body(conf, ctx)
 end
 
 
 function _M.log(conf, ctx)
-    local metadata = plugin.plugin_metadata(plugin_name)
-    local max_pending_entries = metadata and metadata.value and
-                                metadata.value.max_pending_entries or nil
     local entry = log_util.get_log_entry(plugin_name, conf, ctx)
 
     if not entry.route_id then
         entry.route_id = "no-matched"
     end
 
-    if batch_processor_manager:add_entry(conf, entry, max_pending_entries) then
+    if batch_processor_manager:add_entry(conf, entry) then
         return
     end
 
@@ -225,7 +225,7 @@ function _M.log(conf, ctx)
         return send_http_data(conf, data)
     end
 
-    batch_processor_manager:add_entry_to_new_processor(conf, entry, ctx, func, max_pending_entries)
+    batch_processor_manager:add_entry_to_new_processor(conf, entry, ctx, func)
 end
 
 

@@ -450,14 +450,14 @@ curl http://127.0.0.1:9080/ip -i
 
 ## Admin API 的 `X-API-KEY` 指的是什么？是否可以修改？
 
-Admin API 的 `X-API-KEY` 指的是 `./conf/config.yaml` 文件中的 `deployment.admin.admin_key.key`，默认值是 `edd1c9f034335f136f87ad84b625c8f1`。它是 Admin API 的访问 token。
+Admin API 的 `X-API-KEY` 指的是 `./conf/config.yaml` 文件中的 `deployment.admin.admin_key[0].key`。它是 Admin API 的访问 token。
 
-默认情况下，它被设置为 `edd1c9f034335f136f87ad84b625c8f1`，也可以通过修改 `./conf/conf/config` 中的参数来修改，如下示例：
+在默认配置中，该字段为空。APISIX 会在初始化时自动生成一个随机的 Admin API Key，并将其写回 `./conf/config.yaml`。你也可以通过修改 `./conf/config.yaml` 中的参数来显式设置该 Key，如下示例：
 
 ```yaml
 deployment:
   admin:
-    admin_key
+    admin_key:
       - name: "admin"
         key: newkey
         role: admin
@@ -683,7 +683,7 @@ make GOOS=linux GOARCH=amd64
 
 ## 为什么 file-logger 记录日志会出现乱码？
 
-如果你使用的是 `file-logger` 插件，但是在日志文件中出现了乱码，那么可能是因为上游服务的响应体被进行了压缩。你可以将请求头带上不接收压缩响应参数（`gzip;q=0,deflate,sdch`）以解决这个问题，你可以使用 [proxy-rewirte](https://apisix.apache.org/docs/apisix/plugins/proxy-rewrite/) 插件将请求头中的 `accept-encoding` 设置为不接收压缩响应：
+如果你使用的是 `file-logger` 插件，但是在日志文件中出现了乱码，那么可能是因为上游服务的响应体被进行了压缩。你可以将请求头带上不接收压缩响应参数（`gzip;q=0,deflate,sdch`）以解决这个问题，你可以使用 [proxy-rewrite](https://apisix.apache.org/docs/apisix/plugins/proxy-rewrite/) 插件将请求头中的 `accept-encoding` 设置为不接收压缩响应：
 
 ```shell
 curl http://127.0.0.1:9180/apisix/admin/routes/1 \
@@ -732,7 +732,7 @@ Admin API 中 `/apisix/admin/ssls` 用于管理 SSL 对象，如果 APISIX 需�
 
 Upstream 对象中的 `tls.client_cert`、`tls.client_key` 与 `tls.client_cert_id` 用于存放客户端的证书，适用于需要与上游进行 [mTLS 通信](https://apisix.apache.org/zh/docs/apisix/tutorials/client-to-apisix-mtls/)的情况。
 
-`config.yaml` 中的 `ssl_trusted_certificate` 用于配置一个受信任的根证书。它仅用于在 APISIX 内部访问某些具有自签名证书的服务时，避免提示拒绝对方的 SSL 证书。注意：它不用于信任 APISIX 上游的证书，因为 APISIX 不会验证上游证书的合法性。因此，即使上游使用了无效的 TLS 证书，APISIX 仍然可以与其通信，而无需配置根证书。
+`config.yaml` 中的 `ssl_trusted_certificate` 用于配置一个受信任的根证书。它仅用于在 APISIX 内部访问某些具有自签名证书的服务时，避免提示拒绝对方的 SSL 证书。注意：APISIX 默认不会验证上游证书的合法性，只有在 Upstream 上设置了 `tls.verify` 为 `true` 时才会验证，因此在默认情况下即使上游使用了无效的 TLS 证书，APISIX 仍然可以与其通信。开启 `tls.verify` 后，如果 Upstream 设置了 `tls.ca_certs` 则使用它校验，否则使用 `ssl_trusted_certificate`。
 
 ## 如果在使用 APISIX 过程中遇到问题，我可以在哪里寻求更多帮助？
 

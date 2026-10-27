@@ -50,7 +50,7 @@ local function is_data_plane()
 
     local role = try_read_attr(local_conf, "deployment", "role")
     if role == "data_plane" then
-      return true
+        return true
     end
 
     return false
@@ -62,7 +62,9 @@ local function disable_write_if_data_plane()
     local data_plane, err = is_data_plane()
     if err then
         log.error("failed to check data plane role: ", err)
-        return true, err
+        -- the guard only warns for now, so failing to read the local config
+        -- must not be stricter than a confirmed data plane role
+        return false, err
     end
 
     if data_plane then
@@ -144,7 +146,11 @@ local function _new(etcd_conf)
         return nil, nil, err
     end
 
-    etcd_cli = wrap_etcd_client(etcd_cli)
+    local wrap_err
+    etcd_cli, wrap_err = wrap_etcd_client(etcd_cli)
+    if not etcd_cli then
+        return nil, nil, wrap_err
+    end
 
     return etcd_cli, prefix
 end
@@ -257,6 +263,15 @@ local function not_found(res)
 end
 
 
+local function get_header_revision(res)
+    local header = res.body.header
+    if not (header and header.revision) then
+        return nil, "etcd response missing header.revision"
+    end
+    return header.revision
+end
+
+
 -- When `is_dir` is true, returns the value of both the dir key and its descendants.
 -- Otherwise, return the value of key only.
 function _M.get_format(res, real_key, is_dir, formatter)
@@ -273,7 +288,11 @@ function _M.get_format(res, real_key, is_dir, formatter)
         return nil, res.body.error
     end
 
-    res.headers["X-Etcd-Index"] = res.body.header.revision
+    local revision, err = get_header_revision(res)
+    if not revision then
+        return nil, err
+    end
+    res.headers["X-Etcd-Index"] = revision
 
     if not res.body.kvs then
         return not_found(res)
@@ -452,7 +471,11 @@ local function set(key, value, ttl)
         return nil, res.body.error
     end
 
-    res.headers["X-Etcd-Index"] = res.body.header.revision
+    local revision, rev_err = get_header_revision(res)
+    if not revision then
+        return nil, rev_err
+    end
+    res.headers["X-Etcd-Index"] = revision
 
     -- etcd v3 set would not return kv info
     v3_adapter.to_v3(res.body, "set")
@@ -521,7 +544,11 @@ function _M.atomic_set(key, value, ttl, mod_revision)
         return nil, "value changed before overwritten"
     end
 
-    res.headers["X-Etcd-Index"] = res.body.header.revision
+    local revision, rev_err = get_header_revision(res)
+    if not revision then
+        return nil, rev_err
+    end
+    res.headers["X-Etcd-Index"] = revision
     -- etcd v3 set would not return kv info
     v3_adapter.to_v3(res.body, "compareAndSwap")
     res.body.node = {
@@ -555,7 +582,10 @@ function _M.push(key, value, ttl)
     end
 
     -- manually add suffix
-    local index = res.body.header.revision
+    local index, rev_err = get_header_revision(res)
+    if not index then
+        return nil, rev_err
+    end
     index = string.format("%020d", index)
 
     -- set the basic id attribute
@@ -588,7 +618,11 @@ function _M.delete(key)
         return nil, err
     end
 
-    res.headers["X-Etcd-Index"] = res.body.header.revision
+    local revision, rev_err = get_header_revision(res)
+    if not revision then
+        return nil, rev_err
+    end
+    res.headers["X-Etcd-Index"] = revision
 
     if not res.body.deleted then
         return not_found(res), nil
@@ -618,7 +652,11 @@ function _M.rmdir(key, opts)
         return nil, err
     end
 
-    res.headers["X-Etcd-Index"] = res.body.header.revision
+    local revision, rev_err = get_header_revision(res)
+    if not revision then
+        return nil, rev_err
+    end
+    res.headers["X-Etcd-Index"] = revision
 
     if not res.body.deleted then
         return not_found(res), nil

@@ -164,7 +164,10 @@ Using authz-keycloak access_denied_redirect_uri with no TLS is a security risk
             local ok, err = plugin.check_schema({
                 idp_uri = "http://a.com",
                 cas_callback_uri = "/a/b",
-                logout_uri = "/c/d"
+                logout_uri = "/c/d",
+                cookie = {
+                    secret = "0123456789abcdef0123456789abcdef",
+                },
             })
 
             if not ok then
@@ -189,7 +192,10 @@ risk
             local ok, err = plugin.check_schema({
                 idp_uri = "https://a.com",
                 cas_callback_uri = "/a/b",
-                logout_uri = "/c/d"
+                logout_uri = "/c/d",
+                cookie = {
+                    secret = "0123456789abcdef0123456789abcdef",
+                },
             })
             if not ok then
                 ngx.say(err)
@@ -568,3 +574,114 @@ Using loki-logger endpoint_addrs with no TLS is a security risk
 done
 --- no_error_log
 Using loki-logger endpoint_addrs with no TLS is a security risk
+
+
+
+=== TEST 21: kafka-logger with tls verify disabled
+--- config
+    location /t {
+        content_by_lua_block {
+            local plugin = require("apisix.plugins.kafka-logger")
+
+            local ok, err = plugin.check_schema({
+                brokers = {{host = "127.0.0.1", port = 9093}},
+                kafka_topic = "test",
+                tls = { verify = false }
+            })
+            ngx.say(ok and "done" or err)
+        }
+    }
+--- response_body
+done
+--- error_log
+Keeping tls.verify disabled in kafka-logger configuration is a security risk
+
+
+
+=== TEST 22: kafka-logger with tls verify enabled
+--- config
+    location /t {
+        content_by_lua_block {
+            local plugin = require("apisix.plugins.kafka-logger")
+
+            local ok, err = plugin.check_schema({
+                brokers = {{host = "127.0.0.1", port = 9093}},
+                kafka_topic = "test",
+                tls = { verify = true }
+            })
+            ngx.say(ok and "done" or err)
+        }
+    }
+--- response_body
+done
+--- no_error_log
+Keeping tls.verify disabled in kafka-logger configuration is a security risk
+
+
+
+=== TEST 23: error-log-logger with kafka tls verify disabled (metadata)
+--- config
+    location /t {
+        content_by_lua_block {
+            local core = require("apisix.core")
+            local plugin = require("apisix.plugins.error-log-logger")
+
+            local ok, err = plugin.check_schema({
+                kafka = {
+                    brokers = {{host = "127.0.0.1", port = 9093}},
+                    kafka_topic = "test",
+                    tls = { verify = false }
+                }
+            }, core.schema.TYPE_METADATA)
+            ngx.say(ok and "done" or err)
+        }
+    }
+--- response_body
+done
+--- error_log
+Keeping kafka.tls.verify disabled in error-log-logger configuration is a security risk
+
+
+
+=== TEST 24: error-log-logger with kafka tls but verify omitted (defaults to false)
+--- config
+    location /t {
+        content_by_lua_block {
+            local core = require("apisix.core")
+            local plugin = require("apisix.plugins.error-log-logger")
+
+            local ok, err = plugin.check_schema({
+                kafka = {
+                    brokers = {{host = "127.0.0.1", port = 9093}},
+                    kafka_topic = "test",
+                    tls = {}
+                }
+            }, core.schema.TYPE_METADATA)
+            ngx.say(ok and "done" or err)
+        }
+    }
+--- response_body
+done
+--- error_log
+Keeping kafka.tls.verify disabled in error-log-logger configuration is a security risk
+
+
+
+=== TEST 25: kafka-logger with tls but verify omitted (defaults to false)
+--- config
+    location /t {
+        content_by_lua_block {
+            local plugin = require("apisix.plugins.kafka-logger")
+
+            local ok, err = plugin.check_schema({
+                brokers = {{host = "127.0.0.1", port = 9093}},
+                kafka_topic = "test",
+                tls = {}
+            })
+            ngx.say(ok and "done" or err)
+        }
+    }
+--- response_body
+done
+--- error_log
+Keeping tls.verify disabled in kafka-logger configuration is a security risk

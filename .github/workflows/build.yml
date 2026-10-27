@@ -29,16 +29,15 @@ jobs:
         os_name:
           - linux_openresty
         test_dir:
-          - t/plugin/[a-k]*.t
-          - t/stream-plugin t/plugin/[l-z]*.t
-          - t/admin t/cli t/config-center-yaml t/control t/core t/debug t/discovery t/error_page t/http3/admin t/misc
+          - t/plugin/[a-k]*.t t/plugin/dubbo-proxy t/plugin/graphql-proxy-cache
+          - t/stream-plugin t/plugin/[l-z]*.t t/plugin/proxy-cache
+          - t/admin t/cli t/config-center-json t/config-center-yaml t/control t/core t/debug t/discovery t/error_page t/http3/admin t/misc
           - t/node t/pubsub t/router t/script t/secret t/stream-node t/utils t/wasm t/xds-library t/xrpc
 
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 90
     env:
       SERVER_NAME: ${{ matrix.os_name }}
-      OPENRESTY_VERSION: default
 
     steps:
       - name: Check out code
@@ -51,13 +50,17 @@ jobs:
         with:
           go-version: "1.17"
 
+      - name: Get runner image
+        id: runner_image
+        run: echo "os=${ImageOS}" >> "$GITHUB_OUTPUT"
+
       - name: Cache deps
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         env:
           cache-name: cache-deps
         with:
           path: deps
-          key: ${{ runner.os }}-${{ env.cache-name }}-${{ matrix.os_name }}-${{ hashFiles('apisix-master-0.rockspec') }}
+          key: ${{ runner.os }}-${{ steps.runner_image.outputs.os }}-${{ env.cache-name }}-${{ matrix.os_name }}-${{ hashFiles('apisix-master-0.rockspec') }}
 
       - name: Extract test type
         shell: bash
@@ -87,8 +90,7 @@ jobs:
 
       - name: Linux Install
         run: |
-          sudo --preserve-env=OPENRESTY_VERSION \
-          ./ci/${{ matrix.os_name }}_runner.sh do_install
+          sudo ./ci/${{ matrix.os_name }}_runner.sh do_install
 
       - name: Linux launch common services
         run: |
@@ -97,7 +99,7 @@ jobs:
 
       - name: Cache images
         id: cache-images
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         env:
           cache-name: cache-apisix-docker-images
         with:
@@ -149,6 +151,24 @@ jobs:
           java \
             -Djava.net.preferIPv4Stack=true \
             -jar dubbo-demo-provider.one-jar.jar > /tmp/java2.log &
+          # Wait for the Dubbo backends to accept connections;
+          for port in 20880 30880; do
+              deadline=$(( $(date +%s) + 60 ))
+              ready=0
+              while [ "$(date +%s)" -lt "$deadline" ]; do
+                  if (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+                      echo "dubbo backend ready on port $port"
+                      ready=1
+                      break
+                  fi
+                  sleep 1
+              done
+              if [ "$ready" -ne 1 ]; then
+                  echo "::error::dubbo backend on port $port not ready after 60s"
+                  tail -n 200 /tmp/java.log /tmp/java2.log 2>/dev/null || true
+                  exit 1
+              fi
+          done
 
       - name: Build xDS library
         if: steps.test_env.outputs.type == 'last'
@@ -167,7 +187,8 @@ jobs:
       - name: Linux Script
         env:
           TEST_FILE_SUB_DIR: ${{ matrix.test_dir }}
-        run: sudo -E ./ci/${{ matrix.os_name }}_runner.sh script
+        # sudo-rs (Ubuntu 26.04) ignores -E, so pass what the script needs explicitly
+        run: sudo -E env TEST_FILE_SUB_DIR="$TEST_FILE_SUB_DIR" ./ci/${{ matrix.os_name }}_runner.sh script
 
       - if: ${{ steps.cache-images.outputs.cache-hit != 'true' }}
         name: Save docker images

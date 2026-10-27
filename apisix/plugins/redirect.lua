@@ -15,6 +15,7 @@
 -- limitations under the License.
 --
 local core = require("apisix.core")
+local secret = require("apisix.secret")
 local plugin = require("apisix.plugin")
 local tab_insert = table.insert
 local tab_concat = table.concat
@@ -25,6 +26,7 @@ local ipairs = ipairs
 local ngx = ngx
 local str_find = core.string.find
 local str_sub  = string.sub
+local str_lower = string.lower
 local type = type
 local math_random = math.random
 
@@ -107,12 +109,18 @@ function _M.check_schema(conf)
     end
 
     if conf.regex_uri and #conf.regex_uri > 0 then
-        local _, _, err = re_sub("/fake_uri", conf.regex_uri[1],
-                                 conf.regex_uri[2], "jo")
-        if err then
-            local msg = string_format("invalid regex_uri (%s, %s), err:%s",
-                                      conf.regex_uri[1], conf.regex_uri[2], err)
-            return false, msg
+        local pattern = conf.regex_uri[1]
+        local replacement = conf.regex_uri[2]
+        if not secret.is_secret_ref(pattern) then
+            local test_replacement = secret.is_secret_ref(replacement)
+                                     and "" or replacement
+            local _, _, err = re_sub("/fake_uri", pattern,
+                                     test_replacement, "jo")
+            if err then
+                local msg = string_format("invalid regex_uri (%s, %s), err:%s",
+                                          pattern, replacement, err)
+                return false, msg
+            end
         end
     end
 
@@ -124,14 +132,13 @@ function _M.check_schema(conf)
 end
 
 
-    local tmp = {}
 local function concat_new_uri(uri, ctx)
     local passed_uri_segs, err = lrucache(uri, nil, parse_uri, uri)
     if not passed_uri_segs then
         return nil, err
     end
 
-    core.table.clear(tmp)
+    local tmp = core.tablepool.fetch("redirect_new_uri", #passed_uri_segs, 0)
 
     for _, uri_segs in ipairs(passed_uri_segs) do
         local pat1 = uri_segs[1]    -- \$host
@@ -147,7 +154,9 @@ local function concat_new_uri(uri, ctx)
         end
     end
 
-    return tab_concat(tmp, "")
+    local result = tab_concat(tmp, "")
+    core.tablepool.release("redirect_new_uri", tmp)
+    return result
 end
 
 local function get_port(attr)
@@ -190,7 +199,9 @@ function _M.rewrite(conf, ctx)
     local regex_uri = conf.regex_uri
 
     local proxy_proto = core.request.header(ctx, "X-Forwarded-Proto")
-    local _scheme = proxy_proto or core.request.get_scheme(ctx)
+    -- a URI scheme is case-insensitive (RFC 3986, Section 3.1), so a proxy that
+    -- forwards `HTTPS` is stating the same thing as one that forwards `https`
+    local _scheme = str_lower(proxy_proto or core.request.get_scheme(ctx))
     if conf.http_to_https and _scheme ~= "https" then
         if ret_port == nil or ret_port == 443 or ret_port <= 0 or ret_port > 65535  then
             uri = "https://$host$request_uri"

@@ -30,6 +30,10 @@ local ipairs       = ipairs
 local pairs        = pairs
 local type         = type
 local ngx_re       = require("ngx.re")
+local isarray      = require("table.isarray")
+local str_byte     = string.byte
+local str_has_prefix = require("apisix.core.string").has_prefix
+local DOT          = str_byte(".")
 
 
 local _M = {
@@ -119,6 +123,18 @@ end
 
 local deepcopy
 do
+    -- the members of `parent` are shallow-copied when `parent` is `prefix`
+    -- itself or one of its descendants. The match has to stop at a path
+    -- separator, otherwise a prefix like "self.value.plugins" would also
+    -- claim a sibling named "self.value.plugins2".
+    local function under_shallow_prefix(parent, prefix)
+        if not str_has_prefix(parent, prefix) then
+            return false
+        end
+
+        return #parent == #prefix or str_byte(parent, #prefix + 1) == DOT
+    end
+
     local function _deepcopy(orig, copied, parent, opts)
         -- If the array-like table contains nil in the middle,
         -- the len might be smaller than the expected.
@@ -129,7 +145,9 @@ do
         copied[orig] = copy
         for orig_key, orig_value in pairs(orig) do
             local path = parent .. "." .. tostring(orig_key)
-            if opts and array_find(opts.shallows, path) then
+            if opts and (array_find(opts.shallows, path) or
+                (opts.shallow_prefix and
+                 under_shallow_prefix(parent, opts.shallow_prefix))) then
                 copy[orig_key] = orig_value
             else
                 if type(orig_value) == "table" then
@@ -174,10 +192,10 @@ local function merge(origin, extend)
     for k,v in pairs(extend) do
         if type(v) == "table" then
             if type(origin[k] or false) == "table" then
-                if _M.nkeys(origin[k]) ~= #origin[k] then
-                    merge(origin[k] or {}, extend[k] or {})
-                else
+                if isarray(origin[k]) or isarray(v) then
                     origin[k] = v
+                else
+                    merge(origin[k] or {}, extend[k] or {})
                 end
             else
                 origin[k] = v

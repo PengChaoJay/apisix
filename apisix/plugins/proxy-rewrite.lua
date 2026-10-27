@@ -15,6 +15,7 @@
 -- limitations under the License.
 --
 local core        = require("apisix.core")
+local secret      = require("apisix.secret")
 local plugin_name = "proxy-rewrite"
 local pairs       = pairs
 local ipairs      = ipairs
@@ -92,7 +93,19 @@ local schema = {
                                 ["^[^:]+$"] = {
                                     oneOf = {
                                         { type = "string" },
-                                        { type = "number" }
+                                        { type = "number" },
+                                        {
+                                            -- multiple values for the same
+                                            -- header name, e.g. ["v1", "v2"]
+                                            type = "array",
+                                            minItems = 1,
+                                            items = {
+                                                oneOf = {
+                                                    { type = "string" },
+                                                    { type = "number" },
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             },
@@ -105,6 +118,18 @@ local schema = {
                                     oneOf = {
                                         { type = "string" },
                                         { type = "number" },
+                                        {
+                                            -- replace the header with multiple
+                                            -- values, e.g. ["v1", "v2"]
+                                            type = "array",
+                                            minItems = 1,
+                                            items = {
+                                                oneOf = {
+                                                    { type = "string" },
+                                                    { type = "number" },
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             },
@@ -195,11 +220,17 @@ function _M.check_schema(conf)
             return false, "The length of regex_uri should be an even number"
         end
         for i = 1, #conf.regex_uri, 2 do
-            local _, _, err = re_sub("/fake_uri", conf.regex_uri[i],
-                conf.regex_uri[i + 1], "jo")
-            if err then
-                return false, "invalid regex_uri(" .. conf.regex_uri[i] ..
-                    ", " .. conf.regex_uri[i + 1] .. "): " .. err
+            local pattern = conf.regex_uri[i]
+            local replacement = conf.regex_uri[i + 1]
+            if not secret.is_secret_ref(pattern) then
+                local test_replacement = secret.is_secret_ref(replacement)
+                                         and "" or replacement
+                local _, _, err = re_sub("/fake_uri", pattern,
+                    test_replacement, "jo")
+                if err then
+                    return false, "invalid regex_uri(" .. pattern ..
+                        ", " .. replacement .. "): " .. err
+                end
             end
         end
     end
@@ -268,6 +299,13 @@ do
     end
 
 
+    local function resolve_header_value(value, ctx)
+        local val = core.utils.resolve_var_with_captures(value,
+                                        ctx.proxy_rewrite_regex_uri_captures)
+        return core.utils.resolve_var(val, ctx.var)
+    end
+
+
 function _M.rewrite(conf, ctx)
     for _, name in ipairs(upstream_names) do
         if conf[name] then
@@ -277,13 +315,28 @@ function _M.rewrite(conf, ctx)
 
     local upstream_uri = ctx.var.uri
     local separator_escaped = false
+
+    -- resolve_var() below drops the query string, so keep the original one from
+    -- real_request_uri to re-append it when conf.uri is set.
+    local query_string = ""
     if conf.use_real_request_uri_unsafe then
         upstream_uri = ctx.var.real_request_uri
+        local index = str_find(upstream_uri, "?")
+        query_string = index and sub_str(upstream_uri, index) or ""
     end
 
     if conf.uri ~= nil then
         separator_escaped = true
         upstream_uri = core.utils.resolve_var(conf.uri, ctx.var, escape_separator)
+        if query_string ~= "" then
+            -- merge with '&' when conf.uri already carries its own query string,
+            -- otherwise append the original query string as-is
+            if str_find(upstream_uri, "?") then
+                upstream_uri = upstream_uri .. "&" .. sub_str(query_string, 2)
+            else
+                upstream_uri = upstream_uri .. query_string
+            end
+        end
 
     elseif conf.regex_uri ~= nil then
         if not str_find(upstream_uri, "?") then
@@ -329,8 +382,12 @@ function _M.rewrite(conf, ctx)
         end
 
         if index then
+            -- The query part (after '?') keeps its ?, =, & delimiters, but control
+            -- characters in it (e.g. a CR/LF reflected from $uri or a regex capture)
+            -- must still be encoded so they cannot be written verbatim into the
+            -- upstream request line.
             upstream_uri = core.utils.uri_safe_encode(sub_str(upstream_uri, 1, index - 1)) ..
-                sub_str(upstream_uri, index)
+                core.utils.escape_uri_control_chars(sub_str(upstream_uri, index))
         else
             -- The '?' may come from client request '%3f' when we use ngx.var.uri directly or
             -- via regex_uri
@@ -362,22 +419,51 @@ function _M.rewrite(conf, ctx)
 
         local field_cnt = #hdr_op.add
         for i = 1, field_cnt, 2 do
-            local val = core.utils.resolve_var_with_captures(hdr_op.add[i + 1],
-                                            ctx.proxy_rewrite_regex_uri_captures)
-            val = core.utils.resolve_var(val, ctx.var)
-            -- A nil or empty table value will cause add_header function to throw an error.
-            if val then
-                local header = hdr_op.add[i]
-                core.request.add_header(ctx, header, val)
+            local header = hdr_op.add[i]
+            local value = hdr_op.add[i + 1]
+            -- an array value adds the header once per element (multiple
+            -- headers with the same name); a scalar adds it once.
+            if type(value) == "table" then
+                for j = 1, #value do
+                    local val = resolve_header_value(value[j], ctx)
+                    -- guard nil only: add_header throws on nil, while an empty
+                    -- string is a valid value kept to preserve the existing
+                    -- behavior for an unresolved variable/capture.
+                    if val then
+                        core.request.add_header(ctx, header, val)
+                    end
+                end
+            else
+                local val = resolve_header_value(value, ctx)
+                if val then
+                    core.request.add_header(ctx, header, val)
+                end
             end
         end
 
         local field_cnt = #hdr_op.set
         for i = 1, field_cnt, 2 do
-            local val = core.utils.resolve_var_with_captures(hdr_op.set[i + 1],
-                                            ctx.proxy_rewrite_regex_uri_captures)
-            val = core.utils.resolve_var(val, ctx.var)
-            core.request.set_header(ctx, hdr_op.set[i], val)
+            local header = hdr_op.set[i]
+            local value = hdr_op.set[i + 1]
+            -- an array value replaces the header with multiple values in a
+            -- single set; a scalar sets a single value.
+            if type(value) == "table" then
+                local vals = {}
+                local n = 0
+                for j = 1, #value do
+                    local val = resolve_header_value(value[j], ctx)
+                    if val then
+                        n = n + 1
+                        vals[n] = val
+                    end
+                end
+                if n > 0 then
+                    core.request.set_header(ctx, header, vals)
+                end
+            else
+                local val = resolve_header_value(value, ctx)
+                core.request.set_header(ctx, header, val)
+            end
         end
 
         local field_cnt = #hdr_op.remove
